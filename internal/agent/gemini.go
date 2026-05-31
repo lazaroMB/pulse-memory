@@ -85,13 +85,20 @@ func (c *GeminiClient) GenerateAnswer(ctx context.Context, message string, facts
 
 // ExtractFacts parses raw conversation text to extract new atomic factual claims in JSON format
 func (c *GeminiClient) ExtractFacts(ctx context.Context, message string) ([]ExtractedFact, error) {
-	prompt := fmt.Sprintf(`Analyze the following message and extract any new, explicit, long-term facts about the user's preferences, role, company, or state. 
+	prompt := fmt.Sprintf(`Analyze the following message and extract any new, explicit, long-term facts about the user's preferences, role, company, state, or history. 
 Do not extract transient details (like "user is saying hello"). Focus only on structural facts that are useful for long-term memory.
+
+Ensure that facts about past events, history, or previous states preserve their temporal context (e.g. dates, years, or "former" status) in the attribute or value, so they are not misconstrued as current states. 
+Attributes related to past or former states (like previous jobs, past locations, former companies) MUST be strictly prefixed with "former_" or "past_" (e.g., "former_company", "former_company_city", "former_company_country") so they do not conflict with or overwrite current active states (like "company", "company_city", "company_country") in the database.
+For example:
+- If the user says "In 2019 I broke my leg", extract attribute "past_injury" or "injury_history" with value "broke leg in 2019" (do NOT extract attribute "injury" with value "broken leg" which implies a currently active injury).
+- If the user says "I worked at Envato in Melbourne in 2016", extract "former_company" with value "Envato", "former_company_city" with value "Melbourne (2016)", and "former_company_country" with value "Australia (2016)" (do NOT use generic "company_city" or "company_country" as that would overwrite current company details).
+- If the user says "I used to work at Google", extract attribute "former_employer" with value "Google".
 
 Format the output strictly as a JSON array of objects. Do not include markdown code block formatting (like `+"`"+`json). Just output raw JSON.
 Each object must contain:
-- "attribute": short string (snake_case, e.g. "programming_language", "office_location")
-- "value": the actual value (string, e.g. "Go", "Denver")
+- "attribute": short string (snake_case, e.g. "programming_language", "past_injury", "former_company")
+- "value": the actual value (string, e.g. "Go", "broke leg in 2019")
 - "confidence_score": decimal value between 0.0 and 1.0
 
 If no factual claims are present, output an empty JSON array [].

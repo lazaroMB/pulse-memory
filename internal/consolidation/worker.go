@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -105,13 +106,18 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 
 		// Scenario B: Fact already exists but has a DIFFERENT value (Conflict detected!)
 		if exists && existing.Value != ext.Value {
-			log.Printf("[Worker %d] Conflict detected for attribute '%s'. Old: '%s', New: '%s'. Resolving...", 
-				workerID, ext.Attribute, existing.Value, ext.Value)
-			
-			// Deactivate the old, stale fact
-			if err := wp.Store.DeactivateFact(ctx, existing.ID); err != nil {
-				log.Printf("[Worker %d] Error deactivating stale fact %s: %v", workerID, existing.ID, err)
-				continue
+			if isSingularAttribute(ext.Attribute) {
+				log.Printf("[Worker %d] Conflict detected for singular attribute '%s'. Old: '%s', New: '%s'. Resolving...", 
+					workerID, ext.Attribute, existing.Value, ext.Value)
+				
+				// Deactivate the old, stale fact
+				if err := wp.Store.DeactivateFact(ctx, existing.ID); err != nil {
+					log.Printf("[Worker %d] Error deactivating stale fact %s: %v", workerID, existing.ID, err)
+					continue
+				}
+			} else {
+				log.Printf("[Worker %d] Non-exclusive attribute '%s' has new value '%s'. Preserving existing value '%s' to allow coexistence.", 
+					workerID, ext.Attribute, ext.Value, existing.Value)
 			}
 		}
 
@@ -147,4 +153,31 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 
 		log.Printf("[Worker %d] Consolidated and stored new fact: [%s: %s]", workerID, ext.Attribute, ext.Value)
 	}
+}
+
+// isSingularAttribute returns true if the attribute represents a mutually exclusive state
+// (e.g. user name, current company, preferred programming language) that should be
+// deactivated and overwritten when a new value is specified.
+// Cumulative or historical attributes (e.g. past injuries, former companies, hospitalizations)
+// are non-exclusive, allowing multiple facts to coexist and form a list/history of events.
+func isSingularAttribute(attr string) bool {
+	// Historical, list-like, or plural patterns are cumulative
+	if strings.HasPrefix(attr, "former_") ||
+		strings.HasPrefix(attr, "past_") ||
+		strings.HasPrefix(attr, "visited_") ||
+		strings.HasSuffix(attr, "_history") ||
+		strings.HasSuffix(attr, "_list") ||
+		strings.HasSuffix(attr, "_hobbies") ||
+		strings.HasSuffix(attr, "_interests") {
+		return false
+	}
+
+	// Specific cumulative words
+	switch attr {
+	case "hospitalization", "past_injury", "injury_history", "hobby", "interest", "visited_country", "visited_city":
+		return false
+	}
+
+	// Default to mutually exclusive singular state
+	return true
 }
