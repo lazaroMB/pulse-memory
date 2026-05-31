@@ -22,7 +22,7 @@ import (
 
 type Server struct {
 	Store      memory.MemoryStore
-	Gemini     *agent.GeminiClient
+	LLM        agent.LLMClient
 	Filter     *privacy.LocalPrivacyFilter
 	WorkerPool *consolidation.WorkerPool
 }
@@ -68,11 +68,6 @@ func main() {
 		log.Fatal("DATABASE_URL environment variable is required when DB_PROVIDER is 'postgres'.")
 	}
 
-	apiKey := os.Getenv("GEMINI_API_KEY")
-	if apiKey == "" || apiKey == "your_gemini_api_key_here" {
-		log.Fatal("GEMINI_API_KEY environment variable is required.")
-	}
-
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -105,33 +100,72 @@ func main() {
 		log.Fatalf("Database schema initialization failed: %v", err)
 	}
 
-	// 3. Initialize Google Gemini Client
-	genModelName := os.Getenv("GEMINI_GENERATION_MODEL")
-	if genModelName == "" {
-		genModelName = "gemini-1.5-flash"
+	// 3. Initialize LLM Client using the factory
+	llmProvider := os.Getenv("LLM_PROVIDER")
+	if llmProvider == "" {
+		llmProvider = "gemini"
 	}
 
-	embedModelName := os.Getenv("GEMINI_EMBEDDING_MODEL")
-	if embedModelName == "" {
-		embedModelName = "text-embedding-004"
+	var llmAPIKey string
+	var genModelName string
+	var embedModelName string
+
+	if llmProvider == "openai" {
+		llmAPIKey = os.Getenv("OPENAI_API_KEY")
+		if llmAPIKey == "" {
+			llmAPIKey = os.Getenv("LLM_API_KEY")
+		}
+		genModelName = os.Getenv("OPENAI_GENERATION_MODEL")
+		if genModelName == "" {
+			genModelName = "gpt-4o-mini"
+		}
+		embedModelName = os.Getenv("OPENAI_EMBEDDING_MODEL")
+		if embedModelName == "" {
+			embedModelName = "text-embedding-3-small"
+		}
+	} else {
+		// default to gemini
+		llmAPIKey = os.Getenv("GEMINI_API_KEY")
+		if llmAPIKey == "" {
+			llmAPIKey = os.Getenv("LLM_API_KEY")
+		}
+		genModelName = os.Getenv("GEMINI_GENERATION_MODEL")
+		if genModelName == "" {
+			genModelName = "gemini-2.5-flash"
+		}
+		embedModelName = os.Getenv("GEMINI_EMBEDDING_MODEL")
+		if embedModelName == "" {
+			embedModelName = "text-embedding-004"
+		}
 	}
 
-	log.Printf("Initializing Google Gemini API Client (Gen: %s, Embed: %s)...", genModelName, embedModelName)
-	gemini, err := agent.NewGeminiClient(ctx, apiKey, genModelName, embedModelName)
+	if llmAPIKey == "" || llmAPIKey == "your_gemini_api_key_here" || llmAPIKey == "your_openai_api_key_here" {
+		log.Fatalf("LLM API key is required (set LLM_API_KEY, GEMINI_API_KEY, or OPENAI_API_KEY).")
+	}
+
+	llmCfg := agent.Config{
+		Provider:       llmProvider,
+		APIKey:         llmAPIKey,
+		GenModelName:   genModelName,
+		EmbedModelName: embedModelName,
+	}
+
+	log.Printf("Initializing LLM Client (Provider: %s, Gen: %s, Embed: %s)...", llmCfg.Provider, llmCfg.GenModelName, llmCfg.EmbedModelName)
+	llmClient, err := agent.NewLLMClient(ctx, llmCfg)
 	if err != nil {
-		log.Fatalf("Gemini client initialization failed: %v", err)
+		log.Fatalf("LLM client initialization failed: %v", err)
 	}
-	defer gemini.Close()
+	defer llmClient.Close()
 
 	// 4. Initialize components and background workers
 	filter := privacy.NewLocalPrivacyFilter()
-	workerPool := consolidation.NewWorkerPool(store, gemini, 100, 3) // queue size: 100, workers: 3
+	workerPool := consolidation.NewWorkerPool(store, llmClient, 100, 3) // queue size: 100, workers: 3
 	workerPool.Start(ctx)
 	defer workerPool.Stop()
 
 	server := &Server{
 		Store:      store,
-		Gemini:     gemini,
+		LLM:        llmClient,
 		Filter:     filter,
 		WorkerPool: workerPool,
 	}
@@ -213,7 +247,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 2. Generate Vector Embedding of the Query Text for similarity search
-	queryVector, err := s.Gemini.GenerateEmbedding(ctx, cleanMessage)
+	queryVector, err := s.LLM.GenerateEmbedding(ctx, cleanMessage)
 	if err != nil {
 		// Log embedding error and fall back to keyword search (non-vector)
 		log.Printf("Embedding generation failed, falling back to basic metadata retrieval: %v", err)
@@ -243,8 +277,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 5. Generate Answer via Gemini using the retrieved facts
-	reply, err := s.Gemini.GenerateAnswer(ctx, cleanMessage, filteredFacts)
+	// 5. Generate Answer via LLM using the retrieved facts
+	reply, err := s.LLM.GenerateAnswer(ctx, cleanMessage, filteredFacts)
 	if err != nil {
 		log.Printf("LLM generation error: %v", err)
 		http.Error(w, "Failed to generate answer from model", http.StatusInternalServerError)

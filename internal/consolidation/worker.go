@@ -20,18 +20,18 @@ type InteractionLog struct {
 }
 
 type WorkerPool struct {
-	JobQueue    chan InteractionLog
-	Store       memory.MemoryStore
-	Gemini      *agent.GeminiClient
-	MaxWorkers  int
-	stopChan    chan struct{}
+	JobQueue   chan InteractionLog
+	Store      memory.MemoryStore
+	LLM        agent.LLMClient
+	MaxWorkers int
+	stopChan   chan struct{}
 }
 
-func NewWorkerPool(store memory.MemoryStore, gemini *agent.GeminiClient, queueSize int, maxWorkers int) *WorkerPool {
+func NewWorkerPool(store memory.MemoryStore, llm agent.LLMClient, queueSize int, maxWorkers int) *WorkerPool {
 	return &WorkerPool{
 		JobQueue:   make(chan InteractionLog, queueSize),
 		Store:      store,
-		Gemini:     gemini,
+		LLM:        llm,
 		MaxWorkers: maxWorkers,
 		stopChan:   make(chan struct{}),
 	}
@@ -66,8 +66,8 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job InteractionLog) {
 	log.Printf("[Worker %d] Ingesting message from session %s for fact extraction", workerID, job.SessionID)
 
-	// 1. Run Gemini fact extraction
-	extracted, err := wp.Gemini.ExtractFacts(ctx, job.Message)
+	// 1. Run LLM fact extraction
+	extracted, err := wp.LLM.ExtractFacts(ctx, job.Message)
 	if err != nil {
 		log.Printf("[Worker %d] Error extracting facts: %v", workerID, err)
 		return
@@ -123,7 +123,7 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 		// to prevent hitting 429 Rate Limits on Google Gemini Free Tier keys
 		time.Sleep(500 * time.Millisecond)
 
-		embedding, err := wp.Gemini.GenerateEmbedding(ctx, representation)
+		embedding, err := wp.LLM.GenerateEmbedding(ctx, representation)
 		if err != nil {
 			log.Printf("[Worker %d] Error generating embedding for fact [%s: %s]: %v", workerID, ext.Attribute, ext.Value, err)
 			continue

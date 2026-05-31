@@ -1,0 +1,50 @@
+package agent
+
+import (
+	"context"
+	"pulse/internal/memory"
+)
+
+// ExtractedFact holds the intermediate structured output from the LLM.
+type ExtractedFact struct {
+	Attribute       string  `json:"attribute" db:"attribute"`
+	Value           string  `json:"value" db:"val"`
+	ConfidenceScore float64 `json:"confidence_score" db:"confidence_score"`
+}
+
+// Config contains the configuration variables for all supported LLM API providers.
+type Config struct {
+	Provider       string // "gemini", "openai"
+	APIKey         string // API credential key
+	GenModelName   string // Model name for generation (e.g. gemini-2.5-flash or gpt-4o-mini)
+	EmbedModelName string // Model name for embeddings (e.g. text-embedding-004 or text-embedding-3-small)
+}
+
+// LLMClient defines the boundary for LLM interaction, including vector embeddings,
+// conversational answer generation, and structured factual claim extraction.
+type LLMClient interface {
+	// GenerateEmbedding creates a dense vector representation of the input text
+	GenerateEmbedding(ctx context.Context, text string) ([]float32, error)
+
+	// GenerateAnswer responds to the user by combining their message with retrieved long-term facts
+	GenerateAnswer(ctx context.Context, message string, facts []memory.Fact) (string, error)
+
+	// ExtractFacts parses raw conversation text to extract new atomic factual claims
+	ExtractFacts(ctx context.Context, message string) ([]ExtractedFact, error)
+
+	// Close terminates the client and cleans up any open connections/resources
+	Close()
+}
+
+// NewLLMClient instantiates a concrete LLM provider matching the configured provider.
+func NewLLMClient(ctx context.Context, cfg Config) (LLMClient, error) {
+	switch cfg.Provider {
+	case "gemini":
+		return NewGeminiClient(ctx, cfg.APIKey, cfg.GenModelName, cfg.EmbedModelName)
+	case "openai":
+		return NewOpenAIClient(ctx, cfg.APIKey, cfg.GenModelName, cfg.EmbedModelName)
+	default:
+		// Default to gemini if not specified or unrecognized for backward compatibility
+		return NewGeminiClient(ctx, cfg.APIKey, cfg.GenModelName, cfg.EmbedModelName)
+	}
+}

@@ -83,13 +83,6 @@ func (c *GeminiClient) GenerateAnswer(ctx context.Context, message string, facts
 	return replyBuilder.String(), nil
 }
 
-// ExtractedFact holds the intermediate structured output from the LLM
-type ExtractedFact struct {
-	Attribute       string  `json:"attribute"`
-	Value           string  `json:"value"`
-	ConfidenceScore float64 `json:"confidence_score"`
-}
-
 // ExtractFacts parses raw conversation text to extract new atomic factual claims in JSON format
 func (c *GeminiClient) ExtractFacts(ctx context.Context, message string) ([]ExtractedFact, error) {
 	prompt := fmt.Sprintf(`Analyze the following message and extract any new, explicit, long-term facts about the user's preferences, role, company, or state. 
