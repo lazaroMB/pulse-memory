@@ -37,8 +37,8 @@ type LLMClient interface {
 	// GenerateEmbeddings creates dense vector representations for multiple inputs in a single batch request
 	GenerateEmbeddings(ctx context.Context, texts []string) ([][]float32, error)
 
-	// GenerateAnswer responds to the user by combining their message with retrieved long-term facts
-	GenerateAnswer(ctx context.Context, message string, facts []memory.Fact) (string, error)
+	// GenerateAnswer responds to the user by combining their message with retrieved long-term facts and short-term chat history
+	GenerateAnswer(ctx context.Context, message string, history []memory.ChatMessage, facts []memory.Fact) (string, error)
 
 	// ExtractFacts parses raw conversation text to extract new atomic factual claims
 	ExtractFacts(ctx context.Context, message string) ([]ExtractedFact, error)

@@ -24,15 +24,17 @@ type InteractionLog struct {
 type WorkerPool struct {
 	JobQueue   chan InteractionLog
 	Store      memory.MemoryStore
+	ChatMemory memory.ChatMemory
 	LLM        agent.LLMClient
 	MaxWorkers int
 	stopChan   chan struct{}
 }
 
-func NewWorkerPool(store memory.MemoryStore, llm agent.LLMClient, queueSize int, maxWorkers int) *WorkerPool {
+func NewWorkerPool(store memory.MemoryStore, chatMemory memory.ChatMemory, llm agent.LLMClient, queueSize int, maxWorkers int) *WorkerPool {
 	return &WorkerPool{
 		JobQueue:   make(chan InteractionLog, queueSize),
 		Store:      store,
+		ChatMemory: chatMemory,
 		LLM:        llm,
 		MaxWorkers: maxWorkers,
 		stopChan:   make(chan struct{}),
@@ -68,6 +70,25 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job InteractionLog) {
 	log.Printf("[Worker %d] Ingesting message from session %s for fact & relation extraction", workerID, job.SessionID)
 
+	// Fetch conversational context from short-term memory
+	history, err := wp.ChatMemory.GetSessionHistory(ctx, job.SessionID, 10)
+	if err != nil {
+		log.Printf("[Worker %d] Error retrieving chat history for session %s: %v", workerID, job.SessionID, err)
+		history = []memory.ChatMessage{}
+	}
+
+	// Format conversational transcript context to allow pronoun resolution (e.g. "she" -> Emily)
+	var dialogBuilder strings.Builder
+	if len(history) > 0 {
+		dialogBuilder.WriteString("Conversation Context:\n")
+		for _, msg := range history {
+			dialogBuilder.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content))
+		}
+		dialogBuilder.WriteString("\nMessage to process:\n")
+	}
+	dialogBuilder.WriteString(fmt.Sprintf("%s: %s", job.Sender, job.Message))
+	contextMsg := dialogBuilder.String()
+
 	// 1. Run LLM fact and relation extraction concurrently
 	var (
 		extractedFacts []agent.ExtractedFact
@@ -80,11 +101,11 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 	wgExtract.Add(2)
 	go func() {
 		defer wgExtract.Done()
-		extractedFacts, factsErr = wp.LLM.ExtractFacts(ctx, job.Message)
+		extractedFacts, factsErr = wp.LLM.ExtractFacts(ctx, contextMsg)
 	}()
 	go func() {
 		defer wgExtract.Done()
-		extractedRels, relsErr = wp.LLM.ExtractRelations(ctx, job.Message)
+		extractedRels, relsErr = wp.LLM.ExtractRelations(ctx, contextMsg)
 	}()
 	wgExtract.Wait()
 
@@ -227,6 +248,18 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 						ValidFrom:       time.Now(),
 						SourceAgent:     job.Sender,
 					}, targetEmb)
+				}
+
+				// 2. Check if relation already exists in the database to prevent duplicate writes
+				existingRels, err := wp.Store.GetActiveRelations(ctx, sourceID)
+				if err == nil {
+					for _, extRel := range existingRels {
+						if extRel.TargetID == targetID && strings.ToUpper(extRel.Type) == strings.ToUpper(rel.RelationType) {
+							log.Printf("[Worker %d] Relation already exists in database: [%s -> %s (%s)]. Skipping write.",
+								workerID, sourceName, targetName, extRel.Type)
+							return
+						}
+					}
 				}
 
 				relation := &memory.Relation{

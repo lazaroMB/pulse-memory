@@ -75,8 +75,8 @@ func (c *GeminiClient) GenerateEmbeddings(ctx context.Context, texts []string) (
 	return embeddings, nil
 }
 
-// GenerateAnswer responds to the user by combining their message with retrieved long-term facts
-func (c *GeminiClient) GenerateAnswer(ctx context.Context, message string, facts []memory.Fact) (string, error) {
+// GenerateAnswer responds to the user by combining their message with retrieved long-term facts and short-term chat history
+func (c *GeminiClient) GenerateAnswer(ctx context.Context, message string, history []memory.ChatMessage, facts []memory.Fact) (string, error) {
 	// Construct the context block from active facts
 	var contextBuilder strings.Builder
 	if len(facts) > 0 {
@@ -85,6 +85,15 @@ func (c *GeminiClient) GenerateAnswer(ctx context.Context, message string, facts
 			contextBuilder.WriteString(fmt.Sprintf("- %s: %s (Confidence: %.2f)\n", f.Attribute, f.Value, f.ConfidenceScore))
 		}
 		contextBuilder.WriteString("\nUse the facts above to personalize your answer if relevant. Do not mention the facts explicitly unless asked.\n\n")
+	}
+
+	// Inject short-term chat history
+	if len(history) > 0 {
+		contextBuilder.WriteString("Conversation History:\n")
+		for _, msg := range history {
+			contextBuilder.WriteString(fmt.Sprintf("%s: %s\n", msg.Role, msg.Content))
+		}
+		contextBuilder.WriteString("\n")
 	}
 
 	contextBuilder.WriteString(fmt.Sprintf("User Message: %s\nAnswer:", message))
@@ -111,7 +120,12 @@ func (c *GeminiClient) GenerateAnswer(ctx context.Context, message string, facts
 
 // ExtractFacts parses raw conversation text to extract new atomic factual claims in JSON format
 func (c *GeminiClient) ExtractFacts(ctx context.Context, message string) ([]ExtractedFact, error) {
-	prompt := fmt.Sprintf(`Analyze the following message and extract any new, explicit, long-term facts about the user's preferences, role, company, state, or history. 
+	prompt := fmt.Sprintf(`You will be provided with a message to analyze, which may optionally be accompanied by recent "Conversation Context".
+
+If "Conversation Context" is provided, use it ONLY to resolve references (such as pronouns like "she", "he", "it", "they" or relative references) to their actual entities. 
+CRITICAL: Do NOT extract any facts that were already established or discussed in the "Conversation Context". Focus EXCLUSIVELY on extracting NEW facts mentioned in the "Message to process".
+
+Analyze the message and extract any new, explicit, long-term facts about the user's preferences, role, company, state, or history. 
 Do not extract transient details (like "user is saying hello"). Focus only on structural facts that are useful for long-term memory.
 
 Ensure that facts about past events, history, or previous states preserve their temporal context (e.g. dates, years, or "former" status) in the attribute or value, so they are not misconstrued as current states. 
@@ -127,9 +141,10 @@ Each object must contain:
 - "value": the actual value (string, e.g. "Go", "broke leg in 2019")
 - "confidence_score": decimal value between 0.0 and 1.0
 
-If no factual claims are present, output an empty JSON array [].
+If no new factual claims are present in the latest message, output an empty JSON array [].
 
-Message: "%s"`, message)
+Input:
+%s`, message)
 
 	resp, err := c.genModel.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
@@ -168,7 +183,12 @@ Message: "%s"`, message)
 
 // ExtractRelations parses raw conversation text to extract relationships between the subject and other entities
 func (c *GeminiClient) ExtractRelations(ctx context.Context, message string) ([]ExtractedRelation, error) {
-	prompt := fmt.Sprintf(`Analyze the following message and extract any structural relationships between the speaker (user/subject) and other distinct entities mentioned, OR between any of the entities mentioned in the text.
+	prompt := fmt.Sprintf(`You will be provided with a message to analyze, which may optionally be accompanied by recent "Conversation Context".
+
+If "Conversation Context" is provided, use it ONLY to resolve references (such as pronouns like "she", "he", "it", "they" or relative references) to their actual entities.
+CRITICAL: Do NOT extract any relationships that were already established or discussed in the "Conversation Context". Focus EXCLUSIVELY on extracting NEW structural relationships mentioned in the "Message to process".
+
+Analyze the message and extract any structural relationships between the speaker (user/subject) and other distinct entities mentioned, OR between any of the entities mentioned in the text.
 Only extract relationships that represent a long-term connection. Do not extract transient actions.
 
 Format the output strictly as a JSON array of objects. Do not include markdown code block formatting (like `+"`"+`json). Just output raw JSON.
@@ -178,9 +198,10 @@ Each object must contain:
 - "relation_type": the type of relationship in UPPERCASE snake_case (string, e.g. "WORKS_AT", "DEVELOPED_IN", "LIVES_IN", "KNOWS", "USES", "LOVES", "FRIEND_OF")
 - "confidence": decimal value between 0.0 and 1.0
 
-If no relationships are present, output an empty JSON array [].
+If no new relationships are present, output an empty JSON array [].
 
-Message: "%s"`, message)
+Input:
+%s`, message)
 
 	resp, err := c.genModel.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {

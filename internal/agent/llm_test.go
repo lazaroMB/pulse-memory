@@ -216,7 +216,7 @@ func TestOpenAIClient(t *testing.T) {
 			return http.DefaultTransport.RoundTrip(req)
 		})
 
-		answer, err := client.GenerateAnswer(ctx, "hello", []memory.Fact{
+		answer, err := client.GenerateAnswer(ctx, "hello", nil, []memory.Fact{
 			{Attribute: "name", Value: "Alice", ConfidenceScore: 0.95},
 		})
 		if err != nil {

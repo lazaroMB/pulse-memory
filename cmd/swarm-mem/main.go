@@ -24,6 +24,7 @@ import (
 
 type Server struct {
 	Store      memory.MemoryStore
+	ChatMemory memory.ChatMemory
 	LLM        agent.LLMClient
 	Filter     *privacy.LocalPrivacyFilter
 	WorkerPool *consolidation.WorkerPool
@@ -177,12 +178,42 @@ func main() {
 		}
 	}
 
-	workerPool := consolidation.NewWorkerPool(store, llmClient, queueSize, maxWorkers)
+	// 3b. Initialize Short-Term Chat Memory using the factory
+	chatMemProvider := os.Getenv("CHAT_MEMORY_PROVIDER")
+	if chatMemProvider == "" {
+		chatMemProvider = "redis" // Default to redis
+	}
+
+	chatMemURL := os.Getenv("CHAT_MEMORY_URL")
+	if chatMemURL == "" {
+		chatMemURL = os.Getenv("REDIS_URL")
+		if chatMemURL == "" {
+			chatMemURL = os.Getenv("FALKORDB_URL")
+			if chatMemURL == "" {
+				chatMemURL = "localhost:6379"
+			}
+		}
+	}
+
+	log.Printf("Connecting to short-term chat memory using provider: %s at %s...", chatMemProvider, chatMemURL)
+	chatMemCfg := memory.ChatMemoryConfig{
+		Provider: chatMemProvider,
+		URL:      chatMemURL,
+	}
+
+	chatMemory, err := memory.NewChatMemory(chatMemCfg)
+	if err != nil {
+		log.Fatalf("Short-term chat memory connection failed: %v", err)
+	}
+	defer chatMemory.Close()
+
+	workerPool := consolidation.NewWorkerPool(store, chatMemory, llmClient, queueSize, maxWorkers)
 	workerPool.Start(ctx)
 	defer workerPool.Stop()
 
 	server := &Server{
 		Store:      store,
+		ChatMemory: chatMemory,
 		LLM:        llmClient,
 		Filter:     filter,
 		WorkerPool: workerPool,
@@ -372,12 +403,38 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 5. Generate Answer via LLM using the retrieved facts
-	reply, err := s.LLM.GenerateAnswer(ctx, cleanMessage, filteredFacts)
+	// 4c. Retrieve short-term chat history
+	history, err := s.ChatMemory.GetSessionHistory(ctx, sessionID, 15) // Fetch last 15 messages for context
+	if err != nil {
+		log.Printf("Failed to retrieve chat history for session %s: %v", sessionID, err)
+		history = []memory.ChatMessage{}
+	}
+
+	// 5. Generate Answer via LLM using the retrieved facts and short-term history
+	reply, err := s.LLM.GenerateAnswer(ctx, cleanMessage, history, filteredFacts)
 	if err != nil {
 		log.Printf("LLM generation error: %v", err)
 		http.Error(w, "Failed to generate answer from model", http.StatusInternalServerError)
 		return
+	}
+
+	// 5b. Append interaction turn to short-term chat memory
+	userMsg := memory.ChatMessage{
+		Role:      req.AgentRole,
+		Content:   cleanMessage,
+		Timestamp: time.Now(),
+	}
+	if err := s.ChatMemory.AppendMessage(ctx, sessionID, userMsg); err != nil {
+		log.Printf("Failed to append user message to chat memory: %v", err)
+	}
+
+	assistantMsg := memory.ChatMessage{
+		Role:      "assistant",
+		Content:   reply,
+		Timestamp: time.Now(),
+	}
+	if err := s.ChatMemory.AppendMessage(ctx, sessionID, assistantMsg); err != nil {
+		log.Printf("Failed to append assistant message to chat memory: %v", err)
 	}
 
 	// 6. Push event to the Asynchronous Consolidation queue (The Sleep-Time Pattern)
