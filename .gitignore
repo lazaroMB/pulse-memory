@@ -1,0 +1,24 @@
+# Compiled binaries and build artifacts
+/bin/
+/scripts/
+
+# Environment files containing credentials
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Test coverage and profiling reports
+*.out
+*.prof
+
+# IDEs, Editors, and OS metadata
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
