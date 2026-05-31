@@ -161,7 +161,7 @@ ok
 
 Pulse includes a terminal-based interactive chat interface for real-time memory retrieval testing:
 ```bash
-make test-client
+./scripts/test_client.sh
 ```
 
 This client initiates a dynamic conversation, logs retrieved long-term memory cells from your database, and supports live edge writing shortcuts:

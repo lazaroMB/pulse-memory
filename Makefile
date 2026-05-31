@@ -1,4 +1,4 @@
-.PHONY: all build run test test-client cleanup-db clean help
+.PHONY: all build run test cleanup-db clean help
 
 # Binary name and directory
 BINARY_NAME=swarm-mem
@@ -20,10 +20,6 @@ test:
 	@echo "Running unit tests..."
 	go test -v ./...
 
-test-client:
-	@echo "Running integration test script..."
-	./scripts/test_client.sh
-
 cleanup-db:
 	@echo "Executing database cleanup..."
 	./scripts/cleanup_db.sh
@@ -38,7 +34,6 @@ help:
 	@echo "  make build        - Compile the Go binary to $(BIN_DIR)/$(BINARY_NAME)"
 	@echo "  make run          - Compile and run the HTTP server"
 	@echo "  make test         - Execute unit tests"
-	@echo "  make test-client  - Run the test_client.sh integration script"
 	@echo "  make cleanup-db   - Erase facts and relations tables in database"
 	@echo "  make clean        - Delete the compiled $(BIN_DIR) directory"
 	@echo "  make help         - Display this help message"
