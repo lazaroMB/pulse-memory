@@ -46,4 +46,5 @@ type MemoryStore interface {
 	DeactivateFact(ctx context.Context, factID uuid.UUID) error
 	InsertRelation(ctx context.Context, relation *Relation) error
 	GetActiveRelations(ctx context.Context, entityID uuid.UUID) ([]Relation, error)
+	Close() error
 }

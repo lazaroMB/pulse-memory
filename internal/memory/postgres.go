@@ -29,14 +29,26 @@ func (s *PGStore) Close() error {
 }
 
 func (s *PGStore) InitSchema(ctx context.Context) error {
-	// Enable pgvector extension
+	// 1. Enable pgvector extension (must run outside transactional block in some PG environments)
 	_, err := s.db.ExecContext(ctx, "CREATE EXTENSION IF NOT EXISTS vector;")
 	if err != nil {
 		return fmt.Errorf("failed to enable vector extension: %w", err)
 	}
 
+	// 2. Execute pgvector migrations outside the main transaction.
+	// Since 3072-dimensional embeddings exceed the 2000-dimension limit for pgvector HNSW/IVFFlat indexes,
+	// we drop any existing HNSW index and avoid recreating it. exact sequential scanning is performed.
+	_, _ = s.db.ExecContext(ctx, "DROP INDEX IF EXISTS facts_embedding_hnsw_idx;")
+	_, _ = s.db.ExecContext(ctx, "ALTER TABLE facts ALTER COLUMN embedding TYPE VECTOR(3072);")
+
+	// 3. Start a transaction for core schema tables and index creations
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start schema transaction: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Create facts table
-	// Using VECTOR(3072) which matches the actual dimension returned by gemini-embedding-001
 	factsSchema := `
 	CREATE TABLE IF NOT EXISTS facts (
 		id UUID PRIMARY KEY,
@@ -49,24 +61,16 @@ func (s *PGStore) InitSchema(ctx context.Context) error {
 		valid_until TIMESTAMP WITH TIME ZONE,
 		source_agent VARCHAR(255) NOT NULL
 	);
-	CREATE INDEX IF NOT EXISTS facts_entity_idx ON facts (entity_id);
 	`
-	_, err = s.db.ExecContext(ctx, factsSchema)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, factsSchema); err != nil {
 		return fmt.Errorf("failed to create facts table: %w", err)
 	}
 
-	// Migration: If the table already existed with VECTOR(768), alter the column to VECTOR(3072)
-	// We drop the index first to avoid dependency failures during type alteration
-	_, _ = s.db.ExecContext(ctx, "DROP INDEX IF EXISTS facts_embedding_hnsw_idx;")
-	_, _ = s.db.ExecContext(ctx, "ALTER TABLE facts ALTER COLUMN embedding TYPE VECTOR(3072);")
+	if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS facts_entity_idx ON facts (entity_id);"); err != nil {
+		return fmt.Errorf("failed to create facts_entity_idx: %w", err)
+	}
 
-	// Create HNSW index for fast vector cosine distance search
-	// We wrap it in a transaction block to catch index creation issues gracefully
-	hnswIndex := `CREATE INDEX IF NOT EXISTS facts_embedding_hnsw_idx ON facts USING hnsw (embedding vector_cosine_ops);`
-	_, _ = s.db.ExecContext(ctx, hnswIndex)
-
-	// Create relations table (The Graph structure)
+	// Create relations table
 	relationsSchema := `
 	CREATE TABLE IF NOT EXISTS relations (
 		id UUID PRIMARY KEY,
@@ -76,12 +80,22 @@ func (s *PGStore) InitSchema(ctx context.Context) error {
 		valid_from TIMESTAMP WITH TIME ZONE NOT NULL,
 		valid_until TIMESTAMP WITH TIME ZONE
 	);
-	CREATE INDEX IF NOT EXISTS relations_source_idx ON relations (source_id);
-	CREATE INDEX IF NOT EXISTS relations_target_idx ON relations (target_id);
 	`
-	_, err = s.db.ExecContext(ctx, relationsSchema)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, relationsSchema); err != nil {
 		return fmt.Errorf("failed to create relations table: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS relations_source_idx ON relations (source_id);"); err != nil {
+		return fmt.Errorf("failed to create relations_source_idx: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS relations_target_idx ON relations (target_id);"); err != nil {
+		return fmt.Errorf("failed to create relations_target_idx: %w", err)
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit schema transaction: %w", err)
 	}
 
 	return nil

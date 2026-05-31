@@ -21,7 +21,7 @@ import (
 )
 
 type Server struct {
-	Store      *memory.PGStore
+	Store      memory.MemoryStore
 	Gemini     *agent.GeminiClient
 	Filter     *privacy.LocalPrivacyFilter
 	WorkerPool *consolidation.WorkerPool
@@ -58,9 +58,14 @@ func main() {
 		_ = godotenv.Load(filepath.Join(filepath.Dir(execDir), ".env"))
 	}
 
+	dbProvider := os.Getenv("DB_PROVIDER")
+	if dbProvider == "" {
+		dbProvider = "postgres"
+	}
+
 	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal("DATABASE_URL environment variable is required.")
+	if dbProvider == "postgres" && dbURL == "" {
+		log.Fatal("DATABASE_URL environment variable is required when DB_PROVIDER is 'postgres'.")
 	}
 
 	apiKey := os.Getenv("GEMINI_API_KEY")
@@ -76,9 +81,19 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 2. Initialize database store using sqlx
-	log.Println("Connecting to database...")
-	store, err := memory.NewPGStore(dbURL)
+	// 2. Initialize database store using the factory
+	cfg := memory.Config{
+		Provider:          dbProvider,
+		PostgresURL:       dbURL,
+		Neo4jURI:          os.Getenv("NEO4J_URI"),
+		Neo4jUsername:     os.Getenv("NEO4J_USERNAME"),
+		Neo4jPassword:     os.Getenv("NEO4J_PASSWORD"),
+		FalkorDBURL:       os.Getenv("FALKORDB_URL"),
+		FalkorDBGraphName: os.Getenv("FALKORDB_GRAPH_NAME"),
+	}
+
+	log.Printf("Connecting to database using provider: %s...", dbProvider)
+	store, err := memory.NewMemoryStore(cfg)
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
 	}
