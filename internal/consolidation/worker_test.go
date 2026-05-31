@@ -33,11 +33,15 @@ func TestIsSingularAttribute(t *testing.T) {
 		{"reading_hobbies", false},
 		{"scientific_interests", false},
 
-		// Specific cumulative keywords
+		// Specific cumulative keywords and composite attributes
 		{"hospitalization", false},
 		{"injury_history", false},
 		{"hobby", false},
 		{"interest", false},
+		{"user_preference_hobby", false},
+		{"user_preference_interest", false},
+		{"allergy", false},
+		{"medication", false},
 	}
 
 	for _, tt := range tests {

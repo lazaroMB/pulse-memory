@@ -49,6 +49,32 @@ func (c *GeminiClient) GenerateEmbedding(ctx context.Context, text string) ([]fl
 	return res.Embedding.Values, nil
 }
 
+// GenerateEmbeddings creates dense vector representations for multiple inputs in a single batch request
+func (c *GeminiClient) GenerateEmbeddings(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	batch := c.embedModel.NewBatch()
+	for _, text := range texts {
+		batch.AddContent(genai.Text(text))
+	}
+	res, err := c.embedModel.BatchEmbedContents(ctx, batch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate batch embeddings: %w", err)
+	}
+	if res == nil || len(res.Embeddings) != len(texts) {
+		return nil, fmt.Errorf("unexpected batch embedding response length: got %d, expected %d", len(res.Embeddings), len(texts))
+	}
+	embeddings := make([][]float32, len(res.Embeddings))
+	for i, emb := range res.Embeddings {
+		if emb == nil {
+			return nil, fmt.Errorf("nil embedding at index %d", i)
+		}
+		embeddings[i] = emb.Values
+	}
+	return embeddings, nil
+}
+
 // GenerateAnswer responds to the user by combining their message with retrieved long-term facts
 func (c *GeminiClient) GenerateAnswer(ctx context.Context, message string, facts []memory.Fact) (string, error) {
 	// Construct the context block from active facts
@@ -135,6 +161,56 @@ Message: "%s"`, message)
 	var extracted []ExtractedFact
 	if err := json.Unmarshal([]byte(cleanedJSON), &extracted); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal extracted facts (raw: %s): %w", cleanedJSON, err)
+	}
+
+	return extracted, nil
+}
+
+// ExtractRelations parses raw conversation text to extract relationships between the subject and other entities
+func (c *GeminiClient) ExtractRelations(ctx context.Context, message string) ([]ExtractedRelation, error) {
+	prompt := fmt.Sprintf(`Analyze the following message and extract any structural relationships between the speaker (user/subject) and other distinct entities mentioned, OR between any of the entities mentioned in the text.
+Only extract relationships that represent a long-term connection. Do not extract transient actions.
+
+Format the output strictly as a JSON array of objects. Do not include markdown code block formatting (like `+"`"+`json). Just output raw JSON.
+Each object must contain:
+- "source_entity": the name of the source entity (string, use "user" if it refers to the speaker/user, e.g., "user", "Pepe")
+- "target_entity": the name of the target entity (string, e.g. "Google", "Python", "New York", "Alice")
+- "relation_type": the type of relationship in UPPERCASE snake_case (string, e.g. "WORKS_AT", "DEVELOPED_IN", "LIVES_IN", "KNOWS", "USES", "LOVES", "FRIEND_OF")
+- "confidence": decimal value between 0.0 and 1.0
+
+If no relationships are present, output an empty JSON array [].
+
+Message: "%s"`, message)
+
+	resp, err := c.genModel.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		return nil, fmt.Errorf("failed to extract relations: %w", err)
+	}
+
+	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
+		return nil, nil
+	}
+
+	var jsonBuilder strings.Builder
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if textPart, ok := part.(genai.Text); ok {
+			jsonBuilder.WriteString(string(textPart))
+		}
+	}
+
+	cleanedJSON := strings.TrimSpace(jsonBuilder.String())
+	cleanedJSON = strings.TrimPrefix(cleanedJSON, "```json")
+	cleanedJSON = strings.TrimPrefix(cleanedJSON, "```")
+	cleanedJSON = strings.TrimSuffix(cleanedJSON, "```")
+	cleanedJSON = strings.TrimSpace(cleanedJSON)
+
+	if cleanedJSON == "" || cleanedJSON == "[]" {
+		return nil, nil
+	}
+
+	var extracted []ExtractedRelation
+	if err := json.Unmarshal([]byte(cleanedJSON), &extracted); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal extracted relations (raw: %s): %w", cleanedJSON, err)
 	}
 
 	return extracted, nil

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -65,93 +66,190 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 }
 
 func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job InteractionLog) {
-	log.Printf("[Worker %d] Ingesting message from session %s for fact extraction", workerID, job.SessionID)
+	log.Printf("[Worker %d] Ingesting message from session %s for fact & relation extraction", workerID, job.SessionID)
 
-	// 1. Run LLM fact extraction
-	extracted, err := wp.LLM.ExtractFacts(ctx, job.Message)
-	if err != nil {
-		log.Printf("[Worker %d] Error extracting facts: %v", workerID, err)
-		return
+	// 1. Run LLM fact and relation extraction concurrently
+	var (
+		extractedFacts []agent.ExtractedFact
+		factsErr       error
+		extractedRels  []agent.ExtractedRelation
+		relsErr        error
+		wgExtract      sync.WaitGroup
+	)
+
+	wgExtract.Add(2)
+	go func() {
+		defer wgExtract.Done()
+		extractedFacts, factsErr = wp.LLM.ExtractFacts(ctx, job.Message)
+	}()
+	go func() {
+		defer wgExtract.Done()
+		extractedRels, relsErr = wp.LLM.ExtractRelations(ctx, job.Message)
+	}()
+	wgExtract.Wait()
+
+	if factsErr != nil {
+		log.Printf("[Worker %d] Error extracting facts: %v", workerID, factsErr)
+	}
+	if relsErr != nil {
+		log.Printf("[Worker %d] Error extracting relations: %v", workerID, relsErr)
 	}
 
-	if len(extracted) == 0 {
-		log.Printf("[Worker %d] No long-term facts found in message.", workerID)
-		return
-	}
+	// 2. Process Facts
+	if len(extractedFacts) > 0 {
+		activeFacts, err := wp.Store.SearchHybrid(ctx, &memory.MemorySearchQuery{
+			TargetEntity: job.EntityID,
+			MaxResults:   100, // Fetch all active facts for comparison
+		})
+		if err != nil {
+			log.Printf("[Worker %d] Error fetching active facts for entity: %v", workerID, err)
+		} else {
+			// Create a lookup map of active facts by attribute for fast conflict resolution
+			activeMap := make(map[string]memory.Fact)
+			for _, f := range activeFacts {
+				activeMap[f.Attribute] = f
+			}
 
-	// 2. Fetch active facts to reconcile and resolve conflicts
-	activeFacts, err := wp.Store.SearchHybrid(ctx, &memory.MemorySearchQuery{
-		TargetEntity: job.EntityID,
-		MaxResults:   100, // Fetch all active facts for comparison
-	})
-	if err != nil {
-		log.Printf("[Worker %d] Error fetching active facts for entity: %v", workerID, err)
-		return
-	}
+			var wgFacts sync.WaitGroup
+			for _, ext := range extractedFacts {
+				existing, exists := activeMap[ext.Attribute]
 
-	// Create a lookup map of active facts by attribute for fast conflict resolution
-	activeMap := make(map[string]memory.Fact)
-	for _, f := range activeFacts {
-		activeMap[f.Attribute] = f
-	}
-
-	for _, ext := range extracted {
-		existing, exists := activeMap[ext.Attribute]
-
-		// Scenario A: Fact already exists with the SAME value
-		if exists && existing.Value == ext.Value {
-			log.Printf("[Worker %d] Fact already exists and matches: [%s: %s]. Skipping.", workerID, ext.Attribute, ext.Value)
-			continue
-		}
-
-		// Scenario B: Fact already exists but has a DIFFERENT value (Conflict detected!)
-		if exists && existing.Value != ext.Value {
-			if isSingularAttribute(ext.Attribute) {
-				log.Printf("[Worker %d] Conflict detected for singular attribute '%s'. Old: '%s', New: '%s'. Resolving...", 
-					workerID, ext.Attribute, existing.Value, ext.Value)
-				
-				// Deactivate the old, stale fact
-				if err := wp.Store.DeactivateFact(ctx, existing.ID); err != nil {
-					log.Printf("[Worker %d] Error deactivating stale fact %s: %v", workerID, existing.ID, err)
+				// Scenario A: Fact already exists with the SAME value
+				if exists && existing.Value == ext.Value {
+					log.Printf("[Worker %d] Fact already exists and matches: [%s: %s]. Skipping.", workerID, ext.Attribute, ext.Value)
 					continue
 				}
-			} else {
-				log.Printf("[Worker %d] Non-exclusive attribute '%s' has new value '%s'. Preserving existing value '%s' to allow coexistence.", 
-					workerID, ext.Attribute, ext.Value, existing.Value)
+
+				// Scenario B: Fact already exists but has a DIFFERENT value (Conflict detected!)
+				if exists && existing.Value != ext.Value {
+					if isSingularAttribute(ext.Attribute) {
+						log.Printf("[Worker %d] Conflict detected for singular attribute '%s'. Old: '%s', New: '%s'. Resolving...", 
+							workerID, ext.Attribute, existing.Value, ext.Value)
+						
+						// Deactivate the old, stale fact
+						if err := wp.Store.DeactivateFact(ctx, existing.ID); err != nil {
+							log.Printf("[Worker %d] Error deactivating stale fact %s: %v", workerID, existing.ID, err)
+							continue
+						}
+					} else {
+						log.Printf("[Worker %d] Non-exclusive attribute '%s' has new value '%s'. Preserving existing value '%s' to allow coexistence.", 
+							workerID, ext.Attribute, ext.Value, existing.Value)
+					}
+				}
+
+				// Scenario C: New fact, or resolved conflict (insert new active fact)
+				// Process embedding and storage concurrently to leverage the dynamic embedding queue
+				wgFacts.Add(1)
+				go func(ext agent.ExtractedFact) {
+					defer wgFacts.Done()
+
+					representation := fmt.Sprintf("%s: %s", ext.Attribute, ext.Value)
+
+					embedding, err := wp.LLM.GenerateEmbedding(ctx, representation)
+					if err != nil {
+						log.Printf("[Worker %d] Error generating embedding for fact [%s: %s]: %v", workerID, ext.Attribute, ext.Value, err)
+						return
+					}
+
+					newFact := &memory.Fact{
+						ID:              uuid.New(),
+						EntityID:        job.EntityID,
+						Attribute:       ext.Attribute,
+						Value:           ext.Value,
+						ConfidenceScore: ext.ConfidenceScore,
+						ValidFrom:       time.Now(),
+						ValidUntil:      nil,
+						SourceAgent:     job.Sender,
+					}
+
+					if err := wp.Store.InsertFact(ctx, newFact, embedding); err != nil {
+						log.Printf("[Worker %d] Error inserting new fact [%s: %s]: %v", workerID, ext.Attribute, ext.Value, err)
+						return
+					}
+
+					log.Printf("[Worker %d] Consolidated and stored new fact: [%s: %s]", workerID, ext.Attribute, ext.Value)
+				}(ext)
 			}
+			wgFacts.Wait()
 		}
+	} else {
+		log.Printf("[Worker %d] No long-term facts found in message.", workerID)
+	}
 
-		// Scenario C: New fact, or resolved conflict (insert new active fact)
-		// Generate the embedding for the semantic representation: "attribute: value"
-		representation := fmt.Sprintf("%s: %s", ext.Attribute, ext.Value)
-		
-		// Rate Limit Defense: Add a 500ms delay before each embedding call
-		// to prevent hitting 429 Rate Limits on Google Gemini Free Tier keys
-		time.Sleep(500 * time.Millisecond)
+	// 3. Process Relations
+	if len(extractedRels) > 0 {
+		var wgRels sync.WaitGroup
+		for _, r := range extractedRels {
+			wgRels.Add(1)
+			go func(rel agent.ExtractedRelation) {
+				defer wgRels.Done()
 
-		embedding, err := wp.LLM.GenerateEmbedding(ctx, representation)
-		if err != nil {
-			log.Printf("[Worker %d] Error generating embedding for fact [%s: %s]: %v", workerID, ext.Attribute, ext.Value, err)
-			continue
+				targetName := strings.TrimSpace(strings.ToLower(rel.TargetEntity))
+				if targetName == "" {
+					return
+				}
+				targetID := uuid.NewMD5(uuid.NameSpaceDNS, []byte(targetName))
+
+				// 1. Resolve source ID
+				var sourceID uuid.UUID
+				sourceName := strings.TrimSpace(strings.ToLower(rel.SourceEntity))
+				if sourceName == "" || sourceName == "user" || sourceName == "subject" || sourceName == "john" {
+					sourceID = job.EntityID
+				} else {
+					sourceID = uuid.NewMD5(uuid.NameSpaceDNS, []byte(sourceName))
+
+					// Insert source name fact to resolve UUID -> Name later
+					sourceRep := fmt.Sprintf("name: %s", rel.SourceEntity)
+					sourceEmb, err := wp.LLM.GenerateEmbedding(ctx, sourceRep)
+					if err == nil {
+						_ = wp.Store.InsertFact(ctx, &memory.Fact{
+							ID:              uuid.New(),
+							EntityID:        sourceID,
+							Attribute:       "name",
+							Value:           rel.SourceEntity,
+							ConfidenceScore: 1.0,
+							ValidFrom:       time.Now(),
+							SourceAgent:     job.Sender,
+						}, sourceEmb)
+					}
+				}
+
+				// Insert target name fact to resolve UUID -> Name later
+				targetRep := fmt.Sprintf("name: %s", rel.TargetEntity)
+				targetEmb, err := wp.LLM.GenerateEmbedding(ctx, targetRep)
+				if err == nil {
+					_ = wp.Store.InsertFact(ctx, &memory.Fact{
+						ID:              uuid.New(),
+						EntityID:        targetID,
+						Attribute:       "name",
+						Value:           rel.TargetEntity,
+						ConfidenceScore: 1.0,
+						ValidFrom:       time.Now(),
+						SourceAgent:     job.Sender,
+					}, targetEmb)
+				}
+
+				relation := &memory.Relation{
+					ID:        uuid.New(),
+					SourceID:  sourceID,
+					TargetID:  targetID,
+					Type:      strings.ToUpper(strings.TrimSpace(rel.RelationType)),
+					ValidFrom: time.Now(),
+				}
+
+				if err := wp.Store.InsertRelation(ctx, relation); err != nil {
+					log.Printf("[Worker %d] Error inserting relation [%s -> %s (%s)]: %v",
+						workerID, sourceID, targetID, relation.Type, err)
+					return
+				}
+
+				log.Printf("[Worker %d] Extracted and stored relationship: [%s -> %s (%s)]",
+					workerID, sourceName, targetName, relation.Type)
+			}(r)
 		}
-
-		newFact := &memory.Fact{
-			ID:              uuid.New(),
-			EntityID:        job.EntityID,
-			Attribute:       ext.Attribute,
-			Value:           ext.Value,
-			ConfidenceScore: ext.ConfidenceScore,
-			ValidFrom:       time.Now(),
-			ValidUntil:      nil,
-			SourceAgent:     job.Sender,
-		}
-
-		if err := wp.Store.InsertFact(ctx, newFact, embedding); err != nil {
-			log.Printf("[Worker %d] Error inserting new fact [%s: %s]: %v", workerID, ext.Attribute, ext.Value, err)
-			continue
-		}
-
-		log.Printf("[Worker %d] Consolidated and stored new fact: [%s: %s]", workerID, ext.Attribute, ext.Value)
+		wgRels.Wait()
+	} else {
+		log.Printf("[Worker %d] No relationships found in message.", workerID)
 	}
 }
 
@@ -161,23 +259,29 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 // Cumulative or historical attributes (e.g. past injuries, former companies, hospitalizations)
 // are non-exclusive, allowing multiple facts to coexist and form a list/history of events.
 func isSingularAttribute(attr string) bool {
+	attrLower := strings.ToLower(attr)
+
 	// Historical, list-like, or plural patterns are cumulative
-	if strings.HasPrefix(attr, "former_") ||
-		strings.HasPrefix(attr, "past_") ||
-		strings.HasPrefix(attr, "visited_") ||
-		strings.HasSuffix(attr, "_history") ||
-		strings.HasSuffix(attr, "_list") ||
-		strings.HasSuffix(attr, "_hobbies") ||
-		strings.HasSuffix(attr, "_interests") {
+	if strings.HasPrefix(attrLower, "former_") ||
+		strings.HasPrefix(attrLower, "past_") ||
+		strings.HasPrefix(attrLower, "visited_") ||
+		strings.HasSuffix(attrLower, "_history") ||
+		strings.HasSuffix(attrLower, "_list") ||
+		strings.HasSuffix(attrLower, "_hobbies") ||
+		strings.HasSuffix(attrLower, "_interests") {
 		return false
 	}
 
-	// Specific cumulative words
-	switch attr {
-	case "hospitalization", "past_injury", "injury_history", "hobby", "interest", "visited_country", "visited_city":
+	// Specific cumulative substrings
+	if strings.Contains(attrLower, "hobb") ||        // Matches "hobby", "hobbies", "user_preference_hobby"
+		strings.Contains(attrLower, "interest") ||    // Matches "interest", "interests", "special_interests"
+		strings.Contains(attrLower, "injury") ||      // Matches "injury", "injuries", "past_injury"
+		strings.Contains(attrLower, "hospital") ||    // Matches "hospitalization"
+		strings.Contains(attrLower, "allergy") ||     // Matches "allergy", "allergies"
+		strings.Contains(attrLower, "medication") {   // Matches "medication", "medications"
 		return false
 	}
 
-	// Default to mutually exclusive singular state
+	// Default to mutually exclusive singular state (e.g. user_name, preferred_programming_language)
 	return true
 }

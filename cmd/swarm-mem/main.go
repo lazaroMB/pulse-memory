@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -151,15 +153,31 @@ func main() {
 	}
 
 	log.Printf("Initializing LLM Client (Provider: %s, Gen: %s, Embed: %s)...", llmCfg.Provider, llmCfg.GenModelName, llmCfg.EmbedModelName)
-	llmClient, err := agent.NewLLMClient(ctx, llmCfg)
+	rawLLMClient, err := agent.NewLLMClient(ctx, llmCfg)
 	if err != nil {
 		log.Fatalf("LLM client initialization failed: %v", err)
 	}
+	llmClient := agent.NewBatchingLLMClient(ctx, rawLLMClient)
 	defer llmClient.Close()
 
 	// 4. Initialize components and background workers
 	filter := privacy.NewLocalPrivacyFilter()
-	workerPool := consolidation.NewWorkerPool(store, llmClient, 100, 3) // queue size: 100, workers: 3
+
+	maxWorkers := 3
+	if val := os.Getenv("CONSOLIDATION_MAX_WORKERS"); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+			maxWorkers = parsed
+		}
+	}
+
+	queueSize := 100
+	if val := os.Getenv("CONSOLIDATION_QUEUE_SIZE"); val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+			queueSize = parsed
+		}
+	}
+
+	workerPool := consolidation.NewWorkerPool(store, llmClient, queueSize, maxWorkers)
 	workerPool.Start(ctx)
 	defer workerPool.Stop()
 
@@ -274,6 +292,83 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	for _, fact := range retrievedFacts {
 		if s.Filter.ValidateAccess(ctx, req.AgentRole, &fact) {
 			filteredFacts = append(filteredFacts, fact)
+		}
+	}
+
+	// 4b. Retrieve 1-hop and 2-hop active relationships for Graph Context (Graph RAG)
+	rels, err := s.Store.GetActiveRelations(ctx, entityID)
+	if err == nil && len(rels) > 0 {
+		entityIDs := make(map[uuid.UUID]bool)
+		entityIDs[entityID] = true
+		for _, r := range rels {
+			entityIDs[r.SourceID] = true
+			entityIDs[r.TargetID] = true
+		}
+
+		// Fetch 2-hop relations for connected entities
+		var hop2Rels []memory.Relation
+		for _, r := range rels {
+			otherID := r.TargetID
+			if otherID != entityID {
+				otherRels, err := s.Store.GetActiveRelations(ctx, otherID)
+				if err == nil {
+					for _, or := range otherRels {
+						entityIDs[or.SourceID] = true
+						entityIDs[or.TargetID] = true
+						hop2Rels = append(hop2Rels, or)
+					}
+				}
+			}
+		}
+		rels = append(rels, hop2Rels...)
+
+		// Resolve human-readable names for all entity IDs
+		nameMap := make(map[uuid.UUID]string)
+		nameMap[entityID] = "user" // Speaker is mapped to "user"
+
+		for eID := range entityIDs {
+			if eID == entityID {
+				continue
+			}
+			// Search for "name" fact of this entity to map UUID -> human name
+			facts, err := s.Store.SearchHybrid(ctx, &memory.MemorySearchQuery{
+				TargetEntity: eID,
+				MaxResults:   20,
+			})
+			if err == nil {
+				for _, f := range facts {
+					if f.Attribute == "name" {
+						nameMap[eID] = f.Value
+						break
+					}
+				}
+			}
+			if _, exists := nameMap[eID]; !exists {
+				if len(facts) > 0 {
+					nameMap[eID] = facts[0].Value
+				} else {
+					nameMap[eID] = eID.String()[:8]
+				}
+			}
+		}
+
+		// Deduplicate and format relations as artificial Graph Relation facts
+		seenRels := make(map[string]bool)
+		for _, r := range rels {
+			srcName := nameMap[r.SourceID]
+			tgtName := nameMap[r.TargetID]
+			if srcName == "" || tgtName == "" || srcName == tgtName {
+				continue
+			}
+			relKey := fmt.Sprintf("%s-%s-%s", srcName, r.Type, tgtName)
+			if !seenRels[relKey] {
+				seenRels[relKey] = true
+				filteredFacts = append(filteredFacts, memory.Fact{
+					Attribute:       "graph_relation",
+					Value:           fmt.Sprintf("Graph Relation: %s is linked to %s via %s", srcName, tgtName, r.Type),
+					ConfidenceScore: 1.0,
+				})
+			}
 		}
 	}
 

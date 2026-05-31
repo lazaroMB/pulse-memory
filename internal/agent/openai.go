@@ -89,6 +89,60 @@ func (c *OpenAIClient) GenerateEmbedding(ctx context.Context, text string) ([]fl
 	return res.Data[0].Embedding, nil
 }
 
+// GenerateEmbeddings creates dense vector representations for multiple inputs in a single batch request using OpenAI's Embeddings API.
+func (c *OpenAIClient) GenerateEmbeddings(ctx context.Context, texts []string) ([][]float32, error) {
+	if len(texts) == 0 {
+		return nil, nil
+	}
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"input": texts,
+		"model": c.embedModelName,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal embeddings request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/embeddings", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create embeddings request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("embeddings request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("openai embeddings API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var res struct {
+		Data []struct {
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, fmt.Errorf("failed to decode embeddings response: %w", err)
+	}
+
+	if len(res.Data) != len(texts) {
+		return nil, fmt.Errorf("openai embeddings API returned %d embeddings, expected %d", len(res.Data), len(texts))
+	}
+
+	embeddings := make([][]float32, len(res.Data))
+	for i, d := range res.Data {
+		embeddings[i] = d.Embedding
+	}
+
+	return embeddings, nil
+}
+
 // GenerateAnswer responds to the user by combining their message with retrieved long-term facts using OpenAI's Chat Completions API.
 func (c *OpenAIClient) GenerateAnswer(ctx context.Context, message string, facts []memory.Fact) (string, error) {
 	var contextBuilder strings.Builder
@@ -236,6 +290,88 @@ Message: "%s"`, message)
 	var extracted []ExtractedFact
 	if err := json.Unmarshal([]byte(cleanedJSON), &extracted); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal extracted facts (raw: %s): %w", cleanedJSON, err)
+	}
+
+	return extracted, nil
+}
+
+// ExtractRelations parses raw conversation text to extract relationships between the subject and other entities.
+func (c *OpenAIClient) ExtractRelations(ctx context.Context, message string) ([]ExtractedRelation, error) {
+	prompt := fmt.Sprintf(`Analyze the following message and extract any structural relationships between the speaker (user/subject) and other distinct entities mentioned, OR between any of the entities mentioned in the text.
+Only extract relationships that represent a long-term connection. Do not extract transient actions.
+
+Format the output strictly as a JSON array of objects. Do not include markdown code block formatting (like `+"`"+`json). Just output raw JSON.
+Each object must contain:
+- "source_entity": the name of the source entity (string, use "user" if it refers to the speaker/user, e.g., "user", "Pepe")
+- "target_entity": the name of the target entity (string, e.g. "Google", "Python", "New York", "Alice")
+- "relation_type": the type of relationship in UPPERCASE snake_case (string, e.g. "WORKS_AT", "DEVELOPED_IN", "LIVES_IN", "KNOWS", "USES", "LOVES", "FRIEND_OF")
+- "confidence": decimal value between 0.0 and 1.0
+
+If no relationships are present, output an empty JSON array [].
+
+Message: "%s"`, message)
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": c.genModelName,
+		"messages": []map[string]string{
+			{
+				"role":    "user",
+				"content": prompt,
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal relation extraction request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create relation extraction request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("relation extraction request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("openai relation extraction API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var res struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, fmt.Errorf("failed to decode relation extraction response: %w", err)
+	}
+
+	if len(res.Choices) == 0 {
+		return nil, fmt.Errorf("openai relation extraction API returned zero choices")
+	}
+
+	cleanedJSON := strings.TrimSpace(res.Choices[0].Message.Content)
+	cleanedJSON = strings.TrimPrefix(cleanedJSON, "```json")
+	cleanedJSON = strings.TrimPrefix(cleanedJSON, "```")
+	cleanedJSON = strings.TrimSuffix(cleanedJSON, "```")
+	cleanedJSON = strings.TrimSpace(cleanedJSON)
+
+	if cleanedJSON == "" || cleanedJSON == "[]" {
+		return nil, nil
+	}
+
+	var extracted []ExtractedRelation
+	if err := json.Unmarshal([]byte(cleanedJSON), &extracted); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal extracted relations (raw: %s): %w", cleanedJSON, err)
 	}
 
 	return extracted, nil
