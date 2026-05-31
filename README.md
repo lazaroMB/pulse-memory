@@ -22,8 +22,6 @@ Pulse is built using a provider-agnostic database abstraction layer that nativel
 
 ```
 ├── cmd/
-│   ├── cleanup-db/
-│   │   └── main.go                 # Database table removal script
 │   └── swarm-mem/
 │       └── main.go                 # HTTP server, handlers, and graceful shutdown
 ├── internal/

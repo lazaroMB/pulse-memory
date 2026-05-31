@@ -1,6 +1,5 @@
 # Compiled binaries and build artifacts
 /bin/
-/scripts/
 
 # Environment files containing credentials
 .env
