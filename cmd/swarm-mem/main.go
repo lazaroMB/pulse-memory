@@ -34,15 +34,18 @@ type Server struct {
 }
 
 type ChatRequest struct {
-	SessionID string `json:"session_id"`
-	EntityID  string `json:"entity_id"` // Represents the user or object this memory belongs to
-	AgentRole string `json:"agent_role"`
-	Message   string `json:"message"`
+	SessionID    string `json:"session_id"`
+	EntityID     string `json:"entity_id"` // Represents the user or object this memory belongs to
+	AgentRole    string `json:"agent_role"`
+	Message      string `json:"message"`
+	IncludeFacts bool   `json:"includeFacts"`
+	IncludeFachs bool   `json:"includeFachs"` // Support typo variation in payload
 }
 
 type ChatResponse struct {
-	Reply     string        `json:"reply"`
-	FactsUsed []memory.Fact `json:"facts_used"`
+	ResponseMessage string        `json:"responseMessage"`
+	EntityFacts     []memory.Fact `json:"entityFacts,omitempty"`
+	DocumentFacts   []memory.Fact `json:"documentFacts,omitempty"`
 }
 
 type RelationRequest struct {
@@ -495,11 +498,27 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Timestamp: time.Now(),
 	}
 
+	var entityFacts []memory.Fact
+	var documentFacts []memory.Fact
+
+	if req.IncludeFacts || req.IncludeFachs {
+		entityFacts = []memory.Fact{}
+		documentFacts = []memory.Fact{}
+		for _, fact := range filteredFacts {
+			if fact.SourceAgent == "document" || fact.Attribute == "document_chunk" {
+				documentFacts = append(documentFacts, fact)
+			} else {
+				entityFacts = append(entityFacts, fact)
+			}
+		}
+	}
+
 	// Respond to the caller immediately
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(ChatResponse{
-		Reply:     reply,
-		FactsUsed: filteredFacts,
+		ResponseMessage: reply,
+		EntityFacts:     entityFacts,
+		DocumentFacts:   documentFacts,
 	})
 }
 

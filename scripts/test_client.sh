@@ -8,6 +8,14 @@ SESSION_ID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | cut -c 1-8 || echo "
 ENTITY_ID="c33f20d5-5d9c-4972-bb2f-34d380963579"
 AGENT_ROLE="developer_agent"
 
+# Parse CLI arguments to control fact retrieval
+INCLUDE_FACTS="false"
+for arg in "$@"; do
+    if [[ "$arg" == "--include-facts" || "$arg" == "--facts" || "$arg" == "-f" ]]; then
+        INCLUDE_FACTS="true"
+    fi
+done
+
 # ANSI Terminal Colors
 GREEN="\033[0;32m"
 BLUE="\033[0;34m"
@@ -20,12 +28,13 @@ BOLD="\033[1m"
 echo -e "${BOLD}=========================================================${NC}"
 echo -e "${BOLD}       Multi-Agent Swarm Memory Interactive Chat         ${NC}"
 echo -e "${BOLD}=========================================================${NC}"
-echo -e "${GRAY}Server URL:   ${SERVER_URL}${NC}"
-echo -e "${GRAY}Session ID:   ${SESSION_ID}${NC}"
-echo -e "${GRAY}Entity ID:    ${ENTITY_ID} (John)${NC}"
-echo -e "${GRAY}Agent Role:   ${AGENT_ROLE}${NC}"
-echo -e "${GRAY}Commands:     /exit, /quit (to exit)${NC}"
-echo -e "${GRAY}              /relation <type> <target_id> (to link entity)${NC}"
+echo -e "${GRAY}Server URL:    ${SERVER_URL}${NC}"
+echo -e "${GRAY}Session ID:    ${SESSION_ID}${NC}"
+echo -e "${GRAY}Entity ID:     ${ENTITY_ID} (John)${NC}"
+echo -e "${GRAY}Agent Role:    ${AGENT_ROLE}${NC}"
+echo -e "${GRAY}Include Facts: ${YELLOW}${INCLUDE_FACTS}${NC} (pass --facts, --include-facts or -f to enable)"
+echo -e "${GRAY}Commands:      /exit, /quit (to exit)${NC}"
+echo -e "${GRAY}               /relation <type> <target_id> (to link entity)${NC}"
 echo -e "${BOLD}=========================================================${NC}"
 
 # Check server health
@@ -81,7 +90,8 @@ while true; do
         \"session_id\": \"$SESSION_ID\",
         \"entity_id\": \"$ENTITY_ID\",
         \"agent_role\": \"$AGENT_ROLE\",
-        \"message\": \"$USER_INPUT\"
+        \"message\": \"$USER_INPUT\",
+        \"includeFacts\": $INCLUDE_FACTS
       }")
 
     if [[ -z "$RESPONSE" ]]; then
@@ -90,11 +100,14 @@ while true; do
     fi
 
     # Parse JSON values using Python for maximum portability
-    REPLY=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('reply', ''))" 2>/dev/null)
+    REPLY=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('responseMessage', ''))" 2>/dev/null)
     FACTS=$(echo "$RESPONSE" | python3 -c "
 import sys, json
 try:
-    facts = json.load(sys.stdin).get('facts_used', [])
+    data = json.load(sys.stdin)
+    entity_facts = data.get('entityFacts', []) or []
+    doc_facts = data.get('documentFacts', []) or []
+    facts = entity_facts + doc_facts
     if not facts:
         print('None')
     else:
@@ -114,5 +127,6 @@ except Exception:
         echo -e "\n${GRAY}[No Long-Term Memories Retrieved]${NC}"
     fi
     
-    echo -e "${GRAY}(Cognitive Worker consolidates new facts asynchronously...)${NC}"
+    echo -e "${GRAY}(Full response: $RESPONSE)${NC}"
+    echo -e "${GRAY}---------------------------------------------------------${NC}"
 done

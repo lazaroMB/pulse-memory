@@ -150,14 +150,22 @@ Short-term chat history (up to the last 15 messages) is automatically loaded and
   "session_id": "848e02d6-44ea-4c47-9750-b0ff2c4d9a1f",
   "entity_id": "c33f20d5-5d9c-4972-bb2f-34d380963579",
   "agent_role": "developer_agent",
-  "message": "Hey, I prefer coding backend APIs in Golang and deploying them to Google Cloud. My phone is +1-555-0199."
+  "message": "Hey, I prefer coding backend APIs in Golang and deploying them to Google Cloud. My phone is +1-555-0199.",
+  "includeFacts": true
 }
 ```
-* **Response Body:**
+* **Response Body (when facts are requested via `includeFacts` or `includeFachs`):**
 ```json
 {
-  "reply": "Got it! Since you prefer coding backend APIs in Golang and deploying them on Google Cloud, I will keep that in mind for future reference.",
-  "facts_used": []
+  "responseMessage": "Got it! Since you prefer coding backend APIs in Golang and deploying them on Google Cloud, I will keep that in mind for future reference.",
+  "entityFacts": [],
+  "documentFacts": []
+}
+```
+* **Response Body (when facts are NOT requested):**
+```json
+{
+  "responseMessage": "Got it! Since you prefer coding backend APIs in Golang and deploying them on Google Cloud, I will keep that in mind for future reference."
 }
 ```
 *(Note: PII like phone numbers will be automatically scrubbed locally as `[PHONE_REDACTED]` before database writing or API query).*
@@ -292,9 +300,13 @@ Performs a semantic vector search across all stored document chunks using cosine
 
 Pulse includes a terminal-based interactive chat interface for real-time memory retrieval testing:
 ```bash
+# Run without facts returned in the chat responses (default)
 ./scripts/test_client.sh
+
+# Run with facts returned and printed in the terminal
+./scripts/test_client.sh --facts
 ```
 
-This client initiates a dynamic conversation, logs retrieved long-term memory cells from your database, and supports live edge writing shortcuts:
+This client initiates a dynamic conversation, logs retrieved long-term memory cells from your database (if facts are requested via `--facts`, `--include-facts` or `-f`), and supports live edge writing shortcuts:
 * `/relation <type> <target_id>` (Creates a graph relationship between you and a target node)
 * `/exit` (Terminates the CLI session)
