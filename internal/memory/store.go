@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"pulse/internal/document"
 )
 
 // Fact represents a single, atomic unit of semantic knowledge.
@@ -47,4 +48,15 @@ type MemoryStore interface {
 	InsertRelation(ctx context.Context, relation *Relation) error
 	GetActiveRelations(ctx context.Context, entityID uuid.UUID) ([]Relation, error)
 	Close() error
+
+	// Document Ingestion & Graph Knowledge Extensions
+	InsertDocument(ctx context.Context, doc *document.Document) error
+	GetDocument(ctx context.Context, id uuid.UUID) (*document.Document, error)
+	UpdateDocumentStatus(ctx context.Context, docID uuid.UUID, status document.IngestionStatus, errMsg string) error
+	InsertDocumentChunks(ctx context.Context, chunks []document.DocumentChunk, embeddings [][]float32) error
+	SearchDocumentChunks(ctx context.Context, queryVector []float32, limit int) ([]document.DocumentChunk, error)
+	LinkDocumentToAuthor(ctx context.Context, docID uuid.UUID, authorID uuid.UUID) error
+	LinkDocumentToTopic(ctx context.Context, docID uuid.UUID, topicName string) error
+	LinkFactToSource(ctx context.Context, factID uuid.UUID, docID uuid.UUID, chunkID uuid.UUID) error
 }
+

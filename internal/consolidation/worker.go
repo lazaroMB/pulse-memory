@@ -22,22 +22,24 @@ type InteractionLog struct {
 }
 
 type WorkerPool struct {
-	JobQueue   chan InteractionLog
-	Store      memory.MemoryStore
-	ChatMemory memory.ChatMemory
-	LLM        agent.LLMClient
-	MaxWorkers int
-	stopChan   chan struct{}
+	JobQueue      chan InteractionLog
+	DocumentQueue chan DocumentJob
+	Store         memory.MemoryStore
+	ChatMemory    memory.ChatMemory
+	LLM           agent.LLMClient
+	MaxWorkers    int
+	stopChan      chan struct{}
 }
 
 func NewWorkerPool(store memory.MemoryStore, chatMemory memory.ChatMemory, llm agent.LLMClient, queueSize int, maxWorkers int) *WorkerPool {
 	return &WorkerPool{
-		JobQueue:   make(chan InteractionLog, queueSize),
-		Store:      store,
-		ChatMemory: chatMemory,
-		LLM:        llm,
-		MaxWorkers: maxWorkers,
-		stopChan:   make(chan struct{}),
+		JobQueue:      make(chan InteractionLog, queueSize),
+		DocumentQueue: make(chan DocumentJob, queueSize),
+		Store:         store,
+		ChatMemory:    chatMemory,
+		LLM:           llm,
+		MaxWorkers:    maxWorkers,
+		stopChan:      make(chan struct{}),
 	}
 }
 
@@ -57,6 +59,8 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 		select {
 		case job := <-wp.JobQueue:
 			wp.processJob(ctx, id, job)
+		case docJob := <-wp.DocumentQueue:
+			wp.processDocumentJob(ctx, id, docJob)
 		case <-wp.stopChan:
 			log.Printf("[Worker %d] Stopped", id)
 			return

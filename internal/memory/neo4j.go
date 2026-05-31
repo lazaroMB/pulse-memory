@@ -2,11 +2,13 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+	"pulse/internal/document"
 )
 
 type Neo4jStore struct {
@@ -48,6 +50,16 @@ func (s *Neo4jStore) InitSchema(ctx context.Context) error {
 			"CREATE CONSTRAINT fact_id_unique IF NOT EXISTS FOR (f:Fact) REQUIRE f.id IS UNIQUE",
 			`CREATE VECTOR INDEX fact_embeddings IF NOT EXISTS
 			 FOR (f:Fact) ON (f.embedding)
+			 OPTIONS {
+			   indexProvider: 'vector-2.0',
+			   nodeProperties: ['embedding'],
+			   vectorDimension: 3072,
+			   vectorSimilarityFunction: 'cosine'
+			 }`,
+			"CREATE CONSTRAINT document_id_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
+			"CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (c:DocumentChunk) REQUIRE c.id IS UNIQUE",
+			`CREATE VECTOR INDEX chunk_embeddings IF NOT EXISTS
+			 FOR (c:DocumentChunk) ON (c.embedding)
 			 OPTIONS {
 			   indexProvider: 'vector-2.0',
 			   nodeProperties: ['embedding'],
@@ -374,3 +386,343 @@ func parseFacts(ctx context.Context, res neo4j.ResultWithContext) ([]Fact, error
 	}
 	return facts, nil
 }
+
+func (s *Neo4jStore) InsertDocument(ctx context.Context, doc *document.Document) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	metadataBytes, err := json.Marshal(doc.Metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal document metadata: %w", err)
+	}
+
+	_, err = session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		query := `
+		CREATE (d:Document {
+			id: $id,
+			title: $title,
+			source_type: $source_type,
+			source_url: $source_url,
+			file_path: $file_path,
+			status: $status,
+			error_message: $error_message,
+			metadata_json: $metadata_json,
+			created_at: $created_at,
+			updated_at: $updated_at
+		})
+		`
+		params := map[string]interface{}{
+			"id":            doc.ID.String(),
+			"title":         doc.Title,
+			"source_type":   string(doc.SourceType),
+			"source_url":    doc.SourceURL,
+			"file_path":     doc.FilePath,
+			"status":        string(doc.Status),
+			"error_message": doc.ErrorMessage,
+			"metadata_json": string(metadataBytes),
+			"created_at":    doc.CreatedAt.Format(time.RFC3339Nano),
+			"updated_at":    doc.UpdatedAt.Format(time.RFC3339Nano),
+		}
+		return tx.Run(ctx, query, params)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to insert document node: %w", err)
+	}
+	return nil
+}
+
+func (s *Neo4jStore) GetDocument(ctx context.Context, id uuid.UUID) (*document.Document, error) {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		query := `
+		MATCH (d:Document {id: $id})
+		RETURN d.id AS id, d.title AS title, d.source_type AS source_type, 
+		       d.source_url AS source_url, d.file_path AS file_path, d.status AS status, 
+		       d.error_message AS error_message, d.metadata_json AS metadata_json, 
+		       d.created_at AS created_at, d.updated_at AS updated_at
+		`
+		res, err := tx.Run(ctx, query, map[string]interface{}{"id": id.String()})
+		if err != nil {
+			return nil, err
+		}
+		if !res.Next(ctx) {
+			return nil, fmt.Errorf("document not found")
+		}
+		record := res.Record()
+		idStr, _ := record.Get("id")
+		docID, _ := uuid.Parse(idStr.(string))
+		title, _ := record.Get("title")
+		srcType, _ := record.Get("source_type")
+		
+		var srcURL, filePath, errMsg string
+		if val, ok := record.Get("source_url"); ok && val != nil { srcURL = val.(string) }
+		if val, ok := record.Get("file_path"); ok && val != nil { filePath = val.(string) }
+		if val, ok := record.Get("error_message"); ok && val != nil { errMsg = val.(string) }
+
+		status, _ := record.Get("status")
+		
+		var metadata map[string]string
+		if metaVal, ok := record.Get("metadata_json"); ok && metaVal != nil {
+			if metaStr, ok := metaVal.(string); ok && metaStr != "" {
+				_ = json.Unmarshal([]byte(metaStr), &metadata)
+			}
+		}
+
+		createdStr, _ := record.Get("created_at")
+		updatedStr, _ := record.Get("updated_at")
+		createdAt, _ := time.Parse(time.RFC3339Nano, createdStr.(string))
+		updatedAt, _ := time.Parse(time.RFC3339Nano, updatedStr.(string))
+
+		return &document.Document{
+			ID:           docID,
+			Title:        title.(string),
+			SourceType:   document.SourceType(srcType.(string)),
+			SourceURL:    srcURL,
+			FilePath:     filePath,
+			Status:       document.IngestionStatus(status.(string)),
+			ErrorMessage: errMsg,
+			Metadata:     metadata,
+			CreatedAt:    createdAt,
+			UpdatedAt:    updatedAt,
+		}, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.(*document.Document), nil
+}
+
+func (s *Neo4jStore) UpdateDocumentStatus(ctx context.Context, docID uuid.UUID, status document.IngestionStatus, errMsg string) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		query := `
+		MATCH (d:Document {id: $id})
+		SET d.status = $status, d.error_message = $error_message, d.updated_at = $updated_at
+		`
+		params := map[string]interface{}{
+			"id":            docID.String(),
+			"status":        string(status),
+			"error_message": errMsg,
+			"updated_at":    time.Now().Format(time.RFC3339Nano),
+		}
+		return tx.Run(ctx, query, params)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to update document status: %w", err)
+	}
+	return nil
+}
+
+func (s *Neo4jStore) InsertDocumentChunks(ctx context.Context, chunks []document.DocumentChunk, embeddings [][]float32) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		query := `
+		UNWIND $batch AS item
+		MATCH (d:Document {id: item.document_id})
+		CREATE (c:DocumentChunk {
+			id: item.id,
+			chunk_index: item.chunk_index,
+			content: item.content,
+			embedding: item.embedding,
+			metadata_json: item.metadata_json
+		})
+		CREATE (d)-[:HAS_CHUNK]->(c)
+		`
+		batch := make([]map[string]interface{}, len(chunks))
+		for i, chunk := range chunks {
+			metadataBytes, _ := json.Marshal(chunk.Metadata)
+			var embedding []float64
+			if len(embeddings) > i && len(embeddings[i]) > 0 {
+				embedding = make([]float64, len(embeddings[i]))
+				for j, v := range embeddings[i] {
+					embedding[j] = float64(v)
+				}
+			}
+
+			batch[i] = map[string]interface{}{
+				"id":            chunk.ID.String(),
+				"document_id":   chunk.DocumentID.String(),
+				"chunk_index":   chunk.ChunkIndex,
+				"content":       chunk.Content,
+				"embedding":     embedding,
+				"metadata_json": string(metadataBytes),
+			}
+		}
+
+		return tx.Run(ctx, query, map[string]interface{}{"batch": batch})
+	})
+	if err != nil {
+		return fmt.Errorf("failed to insert document chunks batch: %w", err)
+	}
+	return nil
+}
+
+func (s *Neo4jStore) SearchDocumentChunks(ctx context.Context, queryVector []float32, limit int) ([]document.DocumentChunk, error) {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeRead})
+	defer session.Close(ctx)
+
+	embedding := make([]float64, len(queryVector))
+	for i, v := range queryVector {
+		embedding[i] = float64(v)
+	}
+
+	result, err := session.ExecuteRead(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		query := `
+		MATCH (c:DocumentChunk)
+		WHERE c.embedding IS NOT NULL
+		WITH c, vector.similarity.cosine(c.embedding, $query_vector) AS score
+		ORDER BY score DESC
+		LIMIT $limit
+		RETURN c.id AS id, c.document_id AS document_id, c.chunk_index AS chunk_index, 
+		       c.content AS content, c.metadata_json AS metadata_json
+		`
+		res, err := tx.Run(ctx, query, map[string]interface{}{
+			"query_vector": embedding,
+			"limit":        limit,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		var chunks []document.DocumentChunk
+		for res.Next(ctx) {
+			record := res.Record()
+			idStr, _ := record.Get("id")
+			id, _ := uuid.Parse(idStr.(string))
+			
+			var docID uuid.UUID
+			if docIDVal, ok := record.Get("document_id"); ok && docIDVal != nil {
+				docID, _ = uuid.Parse(docIDVal.(string))
+			} else {
+				// Fallback to match parent Document
+				parentQuery := `MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk {id: $chunk_id}) RETURN d.id AS doc_id`
+				parentRes, err := tx.Run(ctx, parentQuery, map[string]interface{}{"chunk_id": idStr.(string)})
+				if err == nil && parentRes.Next(ctx) {
+					pRec := parentRes.Record()
+					pIDStr, _ := pRec.Get("doc_id")
+					docID, _ = uuid.Parse(pIDStr.(string))
+				}
+			}
+
+			chunkIndex, _ := record.Get("chunk_index")
+			content, _ := record.Get("content")
+			
+			var metadata map[string]string
+			if metaVal, ok := record.Get("metadata_json"); ok && metaVal != nil {
+				if metaStr, ok := metaVal.(string); ok && metaStr != "" {
+					_ = json.Unmarshal([]byte(metaStr), &metadata)
+				}
+			}
+
+			chunks = append(chunks, document.DocumentChunk{
+				ID:         id,
+				DocumentID: docID,
+				ChunkIndex: int(chunkIndex.(int64)),
+				Content:    content.(string),
+				Metadata:   metadata,
+			})
+		}
+		return chunks, nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to search document chunks in neo4j: %w", err)
+	}
+	return result.([]document.DocumentChunk), nil
+}
+
+func (s *Neo4jStore) LinkDocumentToAuthor(ctx context.Context, docID uuid.UUID, authorID uuid.UUID) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		query := `
+		MERGE (d:Document {id: $doc_id})
+		MERGE (e:Entity {id: $author_id})
+		MERGE (e)-[:AUTHORED]->(d)
+		`
+		params := map[string]interface{}{
+			"doc_id":    docID.String(),
+			"author_id": authorID.String(),
+		}
+		return tx.Run(ctx, query, params)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to link document to author: %w", err)
+	}
+	return nil
+}
+
+func (s *Neo4jStore) LinkDocumentToTopic(ctx context.Context, docID uuid.UUID, topicName string) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		query := `
+		MERGE (d:Document {id: $doc_id})
+		MERGE (e:Entity {id: $topic_id})
+		ON CREATE SET e.attribute = "topic", e.val = $topic_name
+		MERGE (d)-[:DISCUSSES]->(e)
+		`
+		topicID := uuid.NewMD5(uuid.NameSpaceDNS, []byte("topic-"+topicName))
+		params := map[string]interface{}{
+			"doc_id":     docID.String(),
+			"topic_id":   topicID.String(),
+			"topic_name": topicName,
+		}
+		return tx.Run(ctx, query, params)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to link document to topic: %w", err)
+	}
+	return nil
+}
+
+func (s *Neo4jStore) LinkFactToSource(ctx context.Context, factID uuid.UUID, docID uuid.UUID, chunkID uuid.UUID) error {
+	session := s.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
+	defer session.Close(ctx)
+
+	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
+		query := `
+		MATCH (f:Fact {id: $fact_id})
+		MATCH (d:Document {id: $doc_id})
+		MERGE (f)-[:EXTRACTED_FROM]->(d)
+		`
+		params := map[string]interface{}{
+			"fact_id": factID.String(),
+			"doc_id":  docID.String(),
+		}
+		if _, err := tx.Run(ctx, query, params); err != nil {
+			return nil, err
+		}
+
+		if chunkID != uuid.Nil {
+			chunkQuery := `
+			MATCH (f:Fact {id: $fact_id})
+			MATCH (c:DocumentChunk {id: $chunk_id})
+			MERGE (f)-[:MENTIONED_IN]->(c)
+			`
+			params["chunk_id"] = chunkID.String()
+			if _, err := tx.Run(ctx, chunkQuery, params); err != nil {
+				return nil, err
+			}
+		}
+
+		return nil, nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to link fact to source document and chunk: %w", err)
+	}
+	return nil
+}
+

@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/jmoiron/sqlx"
+	"pulse/internal/document"
 )
 
 type PGStore struct {
@@ -96,6 +98,90 @@ func (s *PGStore) InitSchema(ctx context.Context) error {
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit schema transaction: %w", err)
+	}
+
+	// 4. Start a separate transaction for document schema tables and vector types
+	docTx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to start document schema transaction: %w", err)
+	}
+	defer docTx.Rollback()
+
+	documentsSchema := `
+	CREATE TABLE IF NOT EXISTS documents (
+		id UUID PRIMARY KEY,
+		title VARCHAR(255) NOT NULL,
+		source_type VARCHAR(50) NOT NULL,
+		source_url TEXT,
+		file_path TEXT,
+		status VARCHAR(50) NOT NULL,
+		error_message TEXT,
+		metadata JSONB,
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+	);
+	`
+	if _, err := docTx.ExecContext(ctx, documentsSchema); err != nil {
+		return fmt.Errorf("failed to create documents table: %w", err)
+	}
+
+	chunksSchema := `
+	CREATE TABLE IF NOT EXISTS document_chunks (
+		id UUID PRIMARY KEY,
+		document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+		chunk_index INT NOT NULL,
+		content TEXT NOT NULL,
+		embedding VECTOR(3072),
+		metadata JSONB
+	);
+	`
+	if _, err := docTx.ExecContext(ctx, chunksSchema); err != nil {
+		return fmt.Errorf("failed to create document_chunks table: %w", err)
+	}
+
+	if _, err := docTx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS doc_chunks_doc_idx ON document_chunks (document_id);"); err != nil {
+		return fmt.Errorf("failed to create doc_chunks_doc_idx: %w", err)
+	}
+
+	// Index drop and update logic for PG vector length on chunks table, similar to facts table
+	_, _ = docTx.ExecContext(ctx, "DROP INDEX IF EXISTS doc_chunks_embedding_hnsw_idx;")
+	_, _ = docTx.ExecContext(ctx, "DROP INDEX IF EXISTS doc_chunks_embedding_idx;")
+
+	topicsSchema := `
+	CREATE TABLE IF NOT EXISTS document_topics (
+		document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+		topic_name VARCHAR(255) NOT NULL,
+		PRIMARY KEY (document_id, topic_name)
+	);
+	`
+	if _, err := docTx.ExecContext(ctx, topicsSchema); err != nil {
+		return fmt.Errorf("failed to create document_topics table: %w", err)
+	}
+
+	authorsSchema := `
+	CREATE TABLE IF NOT EXISTS document_authors (
+		document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+		author_entity_id UUID NOT NULL,
+		PRIMARY KEY (document_id, author_entity_id)
+	);
+	`
+	if _, err := docTx.ExecContext(ctx, authorsSchema); err != nil {
+		return fmt.Errorf("failed to create document_authors table: %w", err)
+	}
+
+	provenanceSchema := `
+	CREATE TABLE IF NOT EXISTS fact_document_provenance (
+		fact_id UUID PRIMARY KEY REFERENCES facts(id) ON DELETE CASCADE,
+		document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+		chunk_id UUID REFERENCES document_chunks(id) ON DELETE SET NULL
+	);
+	`
+	if _, err := docTx.ExecContext(ctx, provenanceSchema); err != nil {
+		return fmt.Errorf("failed to create fact_document_provenance table: %w", err)
+	}
+
+	if err := docTx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit document schema transaction: %w", err)
 	}
 
 	return nil
@@ -221,3 +307,216 @@ func vectorToString(v []float32) string {
 	sb.WriteByte(']')
 	return sb.String()
 }
+
+func (s *PGStore) InsertDocument(ctx context.Context, doc *document.Document) error {
+	metadataBytes, err := json.Marshal(doc.Metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal document metadata: %w", err)
+	}
+
+	query := `
+	INSERT INTO documents (id, title, source_type, source_url, file_path, status, error_message, metadata, created_at, updated_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`
+	_, err = s.db.ExecContext(ctx, query,
+		doc.ID,
+		doc.Title,
+		doc.SourceType,
+		doc.SourceURL,
+		doc.FilePath,
+		doc.Status,
+		doc.ErrorMessage,
+		metadataBytes,
+		doc.CreatedAt,
+		doc.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to insert document: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) GetDocument(ctx context.Context, id uuid.UUID) (*document.Document, error) {
+	type docRow struct {
+		ID           uuid.UUID `db:"id"`
+		Title        string    `db:"title"`
+		SourceType   string    `db:"source_type"`
+		SourceURL    *string   `db:"source_url"`
+		FilePath     *string   `db:"file_path"`
+		Status       string    `db:"status"`
+		ErrorMessage *string   `db:"error_message"`
+		Metadata     []byte    `db:"metadata"`
+		CreatedAt    time.Time `db:"created_at"`
+		UpdatedAt    time.Time `db:"updated_at"`
+	}
+	var r docRow
+	err := s.db.GetContext(ctx, &r, "SELECT id, title, source_type, source_url, file_path, status, error_message, metadata, created_at, updated_at FROM documents WHERE id = $1", id)
+	if err != nil {
+		return nil, fmt.Errorf("failed to select document: %w", err)
+	}
+	var meta map[string]string
+	if len(r.Metadata) > 0 {
+		_ = json.Unmarshal(r.Metadata, &meta)
+	}
+	var srcURL, filePath, errMsg string
+	if r.SourceURL != nil { srcURL = *r.SourceURL }
+	if r.FilePath != nil { filePath = *r.FilePath }
+	if r.ErrorMessage != nil { errMsg = *r.ErrorMessage }
+
+	return &document.Document{
+		ID:           r.ID,
+		Title:        r.Title,
+		SourceType:   document.SourceType(r.SourceType),
+		SourceURL:    srcURL,
+		FilePath:     filePath,
+		Status:       document.IngestionStatus(r.Status),
+		ErrorMessage: errMsg,
+		Metadata:     meta,
+		CreatedAt:    r.CreatedAt,
+		UpdatedAt:    r.UpdatedAt,
+	}, nil
+}
+
+func (s *PGStore) UpdateDocumentStatus(ctx context.Context, docID uuid.UUID, status document.IngestionStatus, errMsg string) error {
+	query := `
+	UPDATE documents
+	SET status = $1, error_message = $2, updated_at = $3
+	WHERE id = $4
+	`
+	_, err := s.db.ExecContext(ctx, query, status, errMsg, time.Now(), docID)
+	if err != nil {
+		return fmt.Errorf("failed to update document status: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) InsertDocumentChunks(ctx context.Context, chunks []document.DocumentChunk, embeddings [][]float32) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	tx, err := s.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction for document chunks: %w", err)
+	}
+	defer tx.Rollback()
+
+	query := `
+	INSERT INTO document_chunks (id, document_id, chunk_index, content, embedding, metadata)
+	VALUES ($1, $2, $3, $4, $5, $6)
+	`
+	for i, chunk := range chunks {
+		metadataBytes, err := json.Marshal(chunk.Metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal chunk metadata at index %d: %w", i, err)
+		}
+
+		var vecStr *string
+		if len(embeddings) > i && len(embeddings[i]) > 0 {
+			s := vectorToString(embeddings[i])
+			vecStr = &s
+		}
+
+		_, err = tx.ExecContext(ctx, query,
+			chunk.ID,
+			chunk.DocumentID,
+			chunk.ChunkIndex,
+			chunk.Content,
+			vecStr,
+			metadataBytes,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert chunk at index %d: %w", i, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit document chunks: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) SearchDocumentChunks(ctx context.Context, queryVector []float32, limit int) ([]document.DocumentChunk, error) {
+	vecStr := vectorToString(queryVector)
+	
+	type chunkRow struct {
+		ID         uuid.UUID `db:"id"`
+		DocumentID uuid.UUID `db:"document_id"`
+		ChunkIndex int       `db:"chunk_index"`
+		Content    string    `db:"content"`
+		Metadata   []byte    `db:"metadata"`
+	}
+
+	query := `
+	SELECT id, document_id, chunk_index, content, metadata
+	FROM document_chunks
+	ORDER BY embedding <=> $1
+	LIMIT $2
+	`
+	var rows []chunkRow
+	err := s.db.SelectContext(ctx, &rows, query, vecStr, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search document chunks: %w", err)
+	}
+
+	chunks := make([]document.DocumentChunk, len(rows))
+	for i, r := range rows {
+		var meta map[string]string
+		if len(r.Metadata) > 0 {
+			_ = json.Unmarshal(r.Metadata, &meta)
+		}
+		chunks[i] = document.DocumentChunk{
+			ID:         r.ID,
+			DocumentID: r.DocumentID,
+			ChunkIndex: r.ChunkIndex,
+			Content:    r.Content,
+			Metadata:   meta,
+		}
+	}
+
+	return chunks, nil
+}
+
+func (s *PGStore) LinkDocumentToAuthor(ctx context.Context, docID uuid.UUID, authorID uuid.UUID) error {
+	query := `
+	INSERT INTO document_authors (document_id, author_entity_id)
+	VALUES ($1, $2)
+	ON CONFLICT (document_id, author_entity_id) DO NOTHING
+	`
+	_, err := s.db.ExecContext(ctx, query, docID, authorID)
+	if err != nil {
+		return fmt.Errorf("failed to link document to author: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) LinkDocumentToTopic(ctx context.Context, docID uuid.UUID, topicName string) error {
+	query := `
+	INSERT INTO document_topics (document_id, topic_name)
+	VALUES ($1, $2)
+	ON CONFLICT (document_id, topic_name) DO NOTHING
+	`
+	_, err := s.db.ExecContext(ctx, query, docID, topicName)
+	if err != nil {
+		return fmt.Errorf("failed to link document to topic: %w", err)
+	}
+	return nil
+}
+
+func (s *PGStore) LinkFactToSource(ctx context.Context, factID uuid.UUID, docID uuid.UUID, chunkID uuid.UUID) error {
+	query := `
+	INSERT INTO fact_document_provenance (fact_id, document_id, chunk_id)
+	VALUES ($1, $2, $3)
+	ON CONFLICT (fact_id) DO UPDATE SET document_id = EXCLUDED.document_id, chunk_id = EXCLUDED.chunk_id
+	`
+	var chunkIDVal interface{} = chunkID
+	if chunkID == uuid.Nil {
+		chunkIDVal = nil
+	}
+	_, err := s.db.ExecContext(ctx, query, factID, docID, chunkIDVal)
+	if err != nil {
+		return fmt.Errorf("failed to link fact to source document: %w", err)
+	}
+	return nil
+}
+

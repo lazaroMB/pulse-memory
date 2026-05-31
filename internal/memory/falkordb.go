@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -10,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	redisgraph "github.com/falkordb/falkordb-go"
 	"github.com/gomodule/redigo/redis"
+	"pulse/internal/document"
 )
 
 type FalkorDBStore struct {
@@ -58,6 +60,10 @@ func (s *FalkorDBStore) InitSchema(ctx context.Context) error {
 	// Attempt to create the vector node index on Facts
 	query := "CALL db.idx.vector.createNodeIndex('Fact', 'embedding', 3072, 'COSINE')"
 	_, _ = graph.Query(query) // Ignore error if index already exists
+
+	// Attempt to create the vector node index on DocumentChunks
+	chunkQuery := "CALL db.idx.vector.createNodeIndex('DocumentChunk', 'embedding', 3072, 'COSINE')"
+	_, _ = graph.Query(chunkQuery) // Ignore error if index already exists
 
 	return nil
 }
@@ -474,3 +480,363 @@ func falkorCosineSimilarity(a, b []float32) float32 {
 	}
 	return dotProduct / (float32(math.Sqrt(float64(normA))) * float32(math.Sqrt(float64(normB))))
 }
+
+func (s *FalkorDBStore) InsertDocument(ctx context.Context, doc *document.Document) error {
+	conn := s.pool.Get()
+	defer conn.Close()
+
+	graph := redisgraph.GraphNew(s.graphName, conn)
+
+	metadataBytes, err := json.Marshal(doc.Metadata)
+	if err != nil {
+		return fmt.Errorf("failed to marshal document metadata: %w", err)
+	}
+
+	query := `
+	CREATE (d:Document {
+		id: $id,
+		title: $title,
+		source_type: $source_type,
+		source_url: $source_url,
+		file_path: $file_path,
+		status: $status,
+		error_message: $error_message,
+		metadata_json: $metadata_json,
+		created_at: $created_at,
+		updated_at: $updated_at
+	})
+	`
+	params := map[string]interface{}{
+		"id":            doc.ID.String(),
+		"title":         doc.Title,
+		"source_type":   string(doc.SourceType),
+		"source_url":    doc.SourceURL,
+		"file_path":     doc.FilePath,
+		"status":        string(doc.Status),
+		"error_message": doc.ErrorMessage,
+		"metadata_json": string(metadataBytes),
+		"created_at":    doc.CreatedAt.Format(time.RFC3339Nano),
+		"updated_at":    doc.UpdatedAt.Format(time.RFC3339Nano),
+	}
+
+	_, err = graph.ParameterizedQuery(query, params)
+	if err != nil {
+		return fmt.Errorf("failed to insert document node: %w", err)
+	}
+	return nil
+}
+
+func (s *FalkorDBStore) GetDocument(ctx context.Context, id uuid.UUID) (*document.Document, error) {
+	conn := s.pool.Get()
+	defer conn.Close()
+
+	graph := redisgraph.GraphNew(s.graphName, conn)
+
+	query := `
+	MATCH (d:Document {id: $id})
+	RETURN d.id AS id, d.title AS title, d.source_type AS source_type, 
+	       d.source_url AS source_url, d.file_path AS file_path, d.status AS status, 
+	       d.error_message AS error_message, d.metadata_json AS metadata_json, 
+	       d.created_at AS created_at, d.updated_at AS updated_at
+	`
+	res, err := graph.ParameterizedQuery(query, map[string]interface{}{"id": id.String()})
+	if err != nil {
+		return nil, err
+	}
+	if !res.Next() {
+		return nil, fmt.Errorf("document not found")
+	}
+	record := res.Record()
+	idStr, _ := record.Get("id")
+	docID, _ := uuid.Parse(idStr.(string))
+	title, _ := record.Get("title")
+	srcType, _ := record.Get("source_type")
+	
+	var srcURL, filePath, errMsg string
+	if val, ok := record.Get("source_url"); ok && val != nil { srcURL = val.(string) }
+	if val, ok := record.Get("file_path"); ok && val != nil { filePath = val.(string) }
+	if val, ok := record.Get("error_message"); ok && val != nil { errMsg = val.(string) }
+
+	status, _ := record.Get("status")
+	
+	var metadata map[string]string
+	if metaVal, ok := record.Get("metadata_json"); ok && metaVal != nil {
+		if metaStr, ok := metaVal.(string); ok && metaStr != "" {
+			_ = json.Unmarshal([]byte(metaStr), &metadata)
+		}
+	}
+
+	createdStr, _ := record.Get("created_at")
+	updatedStr, _ := record.Get("updated_at")
+	createdAt, _ := time.Parse(time.RFC3339Nano, createdStr.(string))
+	updatedAt, _ := time.Parse(time.RFC3339Nano, updatedStr.(string))
+
+	return &document.Document{
+		ID:           docID,
+		Title:        title.(string),
+		SourceType:   document.SourceType(srcType.(string)),
+		SourceURL:    srcURL,
+		FilePath:     filePath,
+		Status:       document.IngestionStatus(status.(string)),
+		ErrorMessage: errMsg,
+		Metadata:     metadata,
+		CreatedAt:    createdAt,
+		UpdatedAt:    updatedAt,
+	}, nil
+}
+
+func (s *FalkorDBStore) UpdateDocumentStatus(ctx context.Context, docID uuid.UUID, status document.IngestionStatus, errMsg string) error {
+	conn := s.pool.Get()
+	defer conn.Close()
+
+	graph := redisgraph.GraphNew(s.graphName, conn)
+
+	query := `
+	MATCH (d:Document {id: $id})
+	SET d.status = $status, d.error_message = $error_message, d.updated_at = $updated_at
+	`
+	params := map[string]interface{}{
+		"id":            docID.String(),
+		"status":        string(status),
+		"error_message": errMsg,
+		"updated_at":    time.Now().Format(time.RFC3339Nano),
+	}
+
+	_, err := graph.ParameterizedQuery(query, params)
+	if err != nil {
+		return fmt.Errorf("failed to update document status: %w", err)
+	}
+	return nil
+}
+
+func (s *FalkorDBStore) InsertDocumentChunks(ctx context.Context, chunks []document.DocumentChunk, embeddings [][]float32) error {
+	if len(chunks) == 0 {
+		return nil
+	}
+
+	conn := s.pool.Get()
+	defer conn.Close()
+
+	graph := redisgraph.GraphNew(s.graphName, conn)
+
+	for i, chunk := range chunks {
+		metadataBytes, _ := json.Marshal(chunk.Metadata)
+		var embedding []interface{}
+		if len(embeddings) > i && len(embeddings[i]) > 0 {
+			embedding = make([]interface{}, len(embeddings[i]))
+			for j, v := range embeddings[i] {
+				embedding[j] = float64(v)
+			}
+		}
+
+		query := `
+		MATCH (d:Document {id: $document_id})
+		CREATE (c:DocumentChunk {
+			id: $id,
+			chunk_index: $chunk_index,
+			content: $content,
+			embedding: $embedding,
+			metadata_json: $metadata_json
+		})
+		CREATE (d)-[:HAS_CHUNK]->(c)
+		`
+		params := map[string]interface{}{
+			"id":            chunk.ID.String(),
+			"document_id":   chunk.DocumentID.String(),
+			"chunk_index":   chunk.ChunkIndex,
+			"content":       chunk.Content,
+			"embedding":     embedding,
+			"metadata_json": string(metadataBytes),
+		}
+
+		_, err := graph.ParameterizedQuery(query, params)
+		if err != nil {
+			return fmt.Errorf("failed to insert document chunk at index %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (s *FalkorDBStore) SearchDocumentChunks(ctx context.Context, queryVector []float32, limit int) ([]document.DocumentChunk, error) {
+	conn := s.pool.Get()
+	defer conn.Close()
+
+	graph := redisgraph.GraphNew(s.graphName, conn)
+
+	query := `
+	MATCH (d:Document)-[:HAS_CHUNK]->(c:DocumentChunk)
+	RETURN c.id AS id, d.id AS document_id, c.chunk_index AS chunk_index, 
+	       c.content AS content, c.metadata_json AS metadata_json, c.embedding AS embedding
+	`
+	res, err := graph.Query(query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve document chunks: %w", err)
+	}
+
+	type scoredChunk struct {
+		chunk document.DocumentChunk
+		score float32
+	}
+
+	var scored []scoredChunk
+
+	for res.Next() {
+		record := res.Record()
+
+		idVal, _ := record.Get("id")
+		id, err := uuid.Parse(idVal.(string))
+		if err != nil {
+			continue
+		}
+
+		docVal, _ := record.Get("document_id")
+		docID, err := uuid.Parse(docVal.(string))
+		if err != nil {
+			continue
+		}
+
+		cIdx, _ := record.Get("chunk_index")
+		content, _ := record.Get("content")
+
+		var metadata map[string]string
+		if metaVal, ok := record.Get("metadata_json"); ok && metaVal != nil {
+			if metaStr, ok := metaVal.(string); ok && metaStr != "" {
+				_ = json.Unmarshal([]byte(metaStr), &metadata)
+			}
+		}
+
+		var chunkIndex int
+		if ci, ok := cIdx.(int64); ok {
+			chunkIndex = int(ci)
+		} else if cf, ok := cIdx.(float64); ok {
+			chunkIndex = int(cf)
+		}
+
+		var chunkVec []float32
+		if embVal, ok := record.Get("embedding"); ok && embVal != nil {
+			if list, ok := embVal.([]interface{}); ok {
+				chunkVec = make([]float32, len(list))
+				for j, item := range list {
+					if f, ok := item.(float64); ok {
+						chunkVec[j] = float32(f)
+					}
+				}
+			}
+		}
+
+		chunk := document.DocumentChunk{
+			ID:         id,
+			DocumentID: docID,
+			ChunkIndex: chunkIndex,
+			Content:    content.(string),
+			Metadata:   metadata,
+		}
+
+		score := falkorCosineSimilarity(queryVector, chunkVec)
+		scored = append(scored, scoredChunk{
+			chunk: chunk,
+			score: score,
+		})
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+
+	n := limit
+	if len(scored) < limit {
+		n = len(scored)
+	}
+
+	chunks := make([]document.DocumentChunk, n)
+	for i := 0; i < n; i++ {
+		chunks[i] = scored[i].chunk
+	}
+
+	return chunks, nil
+}
+
+func (s *FalkorDBStore) LinkDocumentToAuthor(ctx context.Context, docID uuid.UUID, authorID uuid.UUID) error {
+	conn := s.pool.Get()
+	defer conn.Close()
+
+	graph := redisgraph.GraphNew(s.graphName, conn)
+
+	query := `
+	MERGE (d:Document {id: $doc_id})
+	MERGE (e:Entity {id: $author_id})
+	MERGE (e)-[:AUTHORED]->(d)
+	`
+	params := map[string]interface{}{
+		"doc_id":    docID.String(),
+		"author_id": authorID.String(),
+	}
+
+	_, err := graph.ParameterizedQuery(query, params)
+	if err != nil {
+		return fmt.Errorf("failed to link document to author: %w", err)
+	}
+	return nil
+}
+
+func (s *FalkorDBStore) LinkDocumentToTopic(ctx context.Context, docID uuid.UUID, topicName string) error {
+	conn := s.pool.Get()
+	defer conn.Close()
+
+	graph := redisgraph.GraphNew(s.graphName, conn)
+
+	query := `
+	MERGE (d:Document {id: $doc_id})
+	MERGE (e:Entity {id: $topic_id})
+	SET e.attribute = "topic", e.val = $topic_name
+	MERGE (d)-[:DISCUSSES]->(e)
+	`
+	topicID := uuid.NewMD5(uuid.NameSpaceDNS, []byte("topic-"+topicName))
+	params := map[string]interface{}{
+		"doc_id":     docID.String(),
+		"topic_id":   topicID.String(),
+		"topic_name": topicName,
+	}
+
+	_, err := graph.ParameterizedQuery(query, params)
+	if err != nil {
+		return fmt.Errorf("failed to link document to topic: %w", err)
+	}
+	return nil
+}
+
+func (s *FalkorDBStore) LinkFactToSource(ctx context.Context, factID uuid.UUID, docID uuid.UUID, chunkID uuid.UUID) error {
+	conn := s.pool.Get()
+	defer conn.Close()
+
+	graph := redisgraph.GraphNew(s.graphName, conn)
+
+	query := `
+	MATCH (f:Fact {id: $fact_id})
+	MATCH (d:Document {id: $doc_id})
+	MERGE (f)-[:EXTRACTED_FROM]->(d)
+	`
+	params := map[string]interface{}{
+		"fact_id": factID.String(),
+		"doc_id":  docID.String(),
+	}
+
+	if _, err := graph.ParameterizedQuery(query, params); err != nil {
+		return fmt.Errorf("failed to link fact to document: %w", err)
+	}
+
+	if chunkID != uuid.Nil {
+		chunkQuery := `
+		MATCH (f:Fact {id: $fact_id})
+		MATCH (c:DocumentChunk {id: $chunk_id})
+		MERGE (f)-[:MENTIONED_IN]->(c)
+		`
+		params["chunk_id"] = chunkID.String()
+		if _, err := graph.ParameterizedQuery(chunkQuery, params); err != nil {
+			return fmt.Errorf("failed to link fact to chunk: %w", err)
+		}
+	}
+
+	return nil
+}
+
