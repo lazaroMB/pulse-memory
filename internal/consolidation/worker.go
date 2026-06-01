@@ -81,6 +81,14 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 		history = []memory.ChatMessage{}
 	}
 
+	// Filter out the current message and any subsequent messages (like the assistant's response) from the history context
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role == job.Sender && history[i].Content == job.Message {
+			history = history[:i]
+			break
+		}
+	}
+
 	// Format conversational transcript context to allow pronoun resolution (e.g. "she" -> Emily)
 	var dialogBuilder strings.Builder
 	if len(history) > 0 {
@@ -209,16 +217,39 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 			go func(rel agent.ExtractedRelation) {
 				defer wgRels.Done()
 
+				senderName := strings.TrimSpace(strings.ToLower(job.Sender))
+
+				// 1. Resolve target ID
 				targetName := strings.TrimSpace(strings.ToLower(rel.TargetEntity))
 				if targetName == "" {
 					return
 				}
-				targetID := uuid.NewMD5(uuid.NameSpaceDNS, []byte(targetName))
+				var targetID uuid.UUID
+				if targetName == "user" || targetName == "subject" || targetName == "john" || targetName == "speaker" || targetName == senderName {
+					targetID = job.EntityID
+				} else {
+					targetID = uuid.NewMD5(uuid.NameSpaceDNS, []byte(targetName))
 
-				// 1. Resolve source ID
+					// Insert target name fact to resolve UUID -> Name later
+					targetRep := fmt.Sprintf("name: %s", rel.TargetEntity)
+					targetEmb, err := wp.LLM.GenerateEmbedding(ctx, targetRep)
+					if err == nil {
+						_ = wp.Store.InsertFact(ctx, &memory.Fact{
+							ID:              uuid.New(),
+							EntityID:        targetID,
+							Attribute:       "name",
+							Value:           rel.TargetEntity,
+							ConfidenceScore: 1.0,
+							ValidFrom:       time.Now(),
+							SourceAgent:     job.Sender,
+						}, targetEmb)
+					}
+				}
+
+				// 2. Resolve source ID
 				var sourceID uuid.UUID
 				sourceName := strings.TrimSpace(strings.ToLower(rel.SourceEntity))
-				if sourceName == "" || sourceName == "user" || sourceName == "subject" || sourceName == "john" {
+				if sourceName == "" || sourceName == "user" || sourceName == "subject" || sourceName == "john" || sourceName == "speaker" || sourceName == senderName {
 					sourceID = job.EntityID
 				} else {
 					sourceID = uuid.NewMD5(uuid.NameSpaceDNS, []byte(sourceName))
@@ -237,21 +268,6 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 							SourceAgent:     job.Sender,
 						}, sourceEmb)
 					}
-				}
-
-				// Insert target name fact to resolve UUID -> Name later
-				targetRep := fmt.Sprintf("name: %s", rel.TargetEntity)
-				targetEmb, err := wp.LLM.GenerateEmbedding(ctx, targetRep)
-				if err == nil {
-					_ = wp.Store.InsertFact(ctx, &memory.Fact{
-						ID:              uuid.New(),
-						EntityID:        targetID,
-						Attribute:       "name",
-						Value:           rel.TargetEntity,
-						ConfidenceScore: 1.0,
-						ValidFrom:       time.Now(),
-						SourceAgent:     job.Sender,
-					}, targetEmb)
 				}
 
 				// 2. Check if relation already exists in the database to prevent duplicate writes

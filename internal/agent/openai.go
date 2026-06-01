@@ -232,11 +232,12 @@ For example:
 - If the user says "In 2019 I broke my leg", extract attribute "past_injury" or "injury_history" with value "broke leg in 2019" (do NOT extract attribute "injury" with value "broken leg" which implies a currently active injury).
 - If the user says "I worked at Envato in Melbourne in 2016", extract "former_company" with value "Envato", "former_company_city" with value "Melbourne (2016)", and "former_company_country" with value "Australia (2016)" (do NOT use generic "company_city" or "company_country" as that would overwrite current company details).
 - If the user says "I used to work at Google", extract attribute "former_employer" with value "Google".
+- If the user says "I am Juan" or "my name is Juan", extract attribute "user_name" with value "Juan".
 
 Format the output strictly as a JSON array of objects. Do not include markdown code block formatting (like `+"`"+`json). Just output raw JSON.
 Each object must contain:
-- "attribute": short string (snake_case, e.g. "programming_language", "past_injury", "former_company")
-- "value": the actual value (string, e.g. "Go", "broke leg in 2019")
+- "attribute": short string (snake_case, e.g. "user_name", "programming_language", "past_injury", "former_company")
+- "value": the actual value (string, e.g. "Juan", "Go", "broke leg in 2019")
 - "confidence_score": decimal value between 0.0 and 1.0
 
 If no new factual claims are present in the latest message, output an empty JSON array [].
