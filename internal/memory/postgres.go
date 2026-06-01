@@ -616,6 +616,64 @@ func (s *PGStore) GetActiveRelations(ctx context.Context, entityID uuid.UUID) ([
 	return relations, nil
 }
 
+func (s *PGStore) GetActiveRelationsBatch(ctx context.Context, entityIDs []uuid.UUID) ([]Relation, error) {
+	if len(entityIDs) == 0 {
+		return nil, nil
+	}
+	var relations []Relation
+	query, args, err := sqlx.In(`
+	SELECT id, source_id, target_id, rel_type, valid_from, valid_until, memory_strength, stability, last_accessed
+	FROM relations
+	WHERE (source_id IN (?) OR target_id IN (?)) AND valid_until IS NULL
+	`, entityIDs, entityIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build IN query for relations: %w", err)
+	}
+	query = s.db.Rebind(query)
+	err = s.db.SelectContext(ctx, &relations, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get active relations batch: %w", err)
+	}
+	return relations, nil
+}
+
+func (s *PGStore) GetEntityNamesBatch(ctx context.Context, entityIDs []uuid.UUID) (map[uuid.UUID]string, error) {
+	if len(entityIDs) == 0 {
+		return nil, nil
+	}
+	nameMap := make(map[uuid.UUID]string)
+
+	query, args, err := sqlx.In(`
+	SELECT entity_id, attribute, val
+	FROM facts
+	WHERE entity_id IN (?) AND valid_until IS NULL
+	ORDER BY entity_id, (case when attribute = 'name' then 0 else 1 end), valid_from DESC
+	`, entityIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build IN query for entity names: %w", err)
+	}
+	query = s.db.Rebind(query)
+
+	type factRow struct {
+		EntityID  uuid.UUID `db:"entity_id"`
+		Attribute string    `db:"attribute"`
+		Val       string    `db:"val"`
+	}
+	var rows []factRow
+	err = s.db.SelectContext(ctx, &rows, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to select entity names batch: %w", err)
+	}
+
+	for _, row := range rows {
+		if _, exists := nameMap[row.EntityID]; !exists {
+			nameMap[row.EntityID] = row.Val
+		}
+	}
+	return nameMap, nil
+}
+
+
 // Helper to serialize float32 slice to pgvector string format "[v1,v2,v3,...]"
 func vectorToString(v []float32) string {
 	if len(v) == 0 {

@@ -450,59 +450,108 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			entityIDs[r.TargetID] = true
 		}
 
-		// Fetch 2-hop relations for connected entities
-		var hop2Rels []memory.Relation
-		for _, r := range rels {
-			otherID := r.TargetID
-			if otherID != entityID {
-				otherRels, err := s.Store.GetActiveRelations(ctx, otherID)
+		var nameMap map[uuid.UUID]string
+		if pgStore, ok := s.Store.(*memory.PGStore); ok {
+			// Optimized path: batch fetch 2-hop relations in 1 query
+			otherIDsMap := make(map[uuid.UUID]bool)
+			for _, r := range rels {
+				otherID := r.TargetID
+				if otherID != entityID {
+					otherIDsMap[otherID] = true
+				}
+			}
+			var otherIDs []uuid.UUID
+			for oid := range otherIDsMap {
+				otherIDs = append(otherIDs, oid)
+			}
+			if len(otherIDs) > 0 {
+				otherRels, err := pgStore.GetActiveRelationsBatch(ctx, otherIDs)
 				if err == nil {
 					for _, or := range otherRels {
 						entityIDs[or.SourceID] = true
 						entityIDs[or.TargetID] = true
-						hop2Rels = append(hop2Rels, or)
+						rels = append(rels, or)
 					}
-				}
-			}
-		}
-		rels = append(rels, hop2Rels...)
-
-		// Resolve human-readable names for all entity IDs
-		nameMap := make(map[uuid.UUID]string)
-		nameMap[entityID] = "user" // Speaker is mapped to "user"
-
-		for eID := range entityIDs {
-			if eID == entityID {
-				continue
-			}
-			// Search for "name" fact of this entity to map UUID -> human name
-			facts, err := s.Store.SearchHybrid(ctx, &memory.MemorySearchQuery{
-				TargetEntity: eID,
-				MaxResults:   20,
-			})
-			if err == nil {
-				for _, f := range facts {
-					if f.Attribute == "name" {
-						nameMap[eID] = f.Value
-						break
-					}
-				}
-			}
-			if _, exists := nameMap[eID]; !exists {
-				if len(facts) > 0 {
-					nameMap[eID] = facts[0].Value
 				} else {
-					nameMap[eID] = eID.String()[:8]
+					log.Printf("Failed to batch get 2-hop active relations: %v", err)
+				}
+			}
+
+			// Batch resolve names in 1 query
+			var eIDs []uuid.UUID
+			for eID := range entityIDs {
+				if eID != entityID {
+					eIDs = append(eIDs, eID)
+				}
+			}
+			nameMap, err = pgStore.GetEntityNamesBatch(ctx, eIDs)
+			if err != nil {
+				log.Printf("Failed to batch get entity names: %v", err)
+				nameMap = make(map[uuid.UUID]string)
+			}
+		} else {
+			// Fallback path: standard 2-hop relation traversal
+			var hop2Rels []memory.Relation
+			for _, r := range rels {
+				otherID := r.TargetID
+				if otherID != entityID {
+					otherRels, err := s.Store.GetActiveRelations(ctx, otherID)
+					if err == nil {
+						for _, or := range otherRels {
+							entityIDs[or.SourceID] = true
+							entityIDs[or.TargetID] = true
+							hop2Rels = append(hop2Rels, or)
+						}
+					}
+				}
+			}
+			rels = append(rels, hop2Rels...)
+
+			// Fallback path: standard sequential name resolution
+			nameMap = make(map[uuid.UUID]string)
+			for eID := range entityIDs {
+				if eID == entityID {
+					continue
+				}
+				facts, err := s.Store.SearchHybrid(ctx, &memory.MemorySearchQuery{
+					TargetEntity: eID,
+					MaxResults:   20,
+				})
+				if err == nil {
+					for _, f := range facts {
+						if f.Attribute == "name" {
+							nameMap[eID] = f.Value
+							break
+						}
+					}
+				}
+				if _, exists := nameMap[eID]; !exists {
+					if len(facts) > 0 {
+						nameMap[eID] = facts[0].Value
+					} else {
+						nameMap[eID] = eID.String()[:8]
+					}
 				}
 			}
 		}
+
+		if nameMap == nil {
+			nameMap = make(map[uuid.UUID]string)
+		}
+		nameMap[entityID] = "user" // Speaker is mapped to "user"
 
 		// Deduplicate and format relations as artificial Graph Relation facts
 		seenRels := make(map[string]bool)
 		for _, r := range rels {
 			srcName := nameMap[r.SourceID]
 			tgtName := nameMap[r.TargetID]
-			if srcName == "" || tgtName == "" || srcName == tgtName {
+			if srcName == "" {
+				srcName = r.SourceID.String()[:8]
+			}
+			if tgtName == "" {
+				tgtName = r.TargetID.String()[:8]
+			}
+			if srcName == tgtName {
 				continue
 			}
 			relKey := fmt.Sprintf("%s-%s-%s", srcName, r.Type, tgtName)
