@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,123 @@ func NewWorkerPool(store memory.MemoryStore, chatMemory memory.ChatMemory, llm a
 func (wp *WorkerPool) Start(ctx context.Context) {
 	for i := 0; i < wp.MaxWorkers; i++ {
 		go wp.worker(ctx, i)
+	}
+
+	// Start background Entity Resolution loop
+	go wp.entityResolutionLoop(ctx)
+
+	// Start background Community GraphRAG Detection loop
+	go wp.communityDetectionLoop(ctx)
+
+	// Start background Cognitive Reflection loop
+	go wp.reflectionLoop(ctx)
+}
+
+func (wp *WorkerPool) entityResolutionLoop(ctx context.Context) {
+	interval := 5 * time.Minute
+	if val := os.Getenv("ENTITY_RESOLUTION_INTERVAL"); val != "" {
+		if parsed, err := time.ParseDuration(val); err == nil && parsed > 0 {
+			interval = parsed
+		}
+	}
+
+	log.Printf("[Worker Pool] Started background Entity Resolution loop (Interval: %v)", interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Initial warmup delay before running the first scan
+	select {
+	case <-time.After(30 * time.Second):
+		_ = RunEntityResolution(ctx, wp.Store)
+	case <-ctx.Done():
+		return
+	case <-wp.stopChan:
+		return
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			_ = RunEntityResolution(ctx, wp.Store)
+		case <-ctx.Done():
+			log.Println("[Worker Pool] Stopping background Entity Resolution loop (Context cancelled)")
+			return
+		case <-wp.stopChan:
+			log.Println("[Worker Pool] Stopping background Entity Resolution loop (Pool stopped)")
+			return
+		}
+	}
+}
+
+func (wp *WorkerPool) communityDetectionLoop(ctx context.Context) {
+	interval := 15 * time.Minute
+	if val := os.Getenv("COMMUNITY_RESOLUTION_INTERVAL"); val != "" {
+		if parsed, err := time.ParseDuration(val); err == nil && parsed > 0 {
+			interval = parsed
+		}
+	}
+
+	log.Printf("[Worker Pool] Started background Community GraphRAG Detection loop (Interval: %v)", interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Initial warmup delay before running the first scan
+	select {
+	case <-time.After(1 * time.Minute):
+		_ = RunCommunityDetection(ctx, wp.Store, wp.LLM)
+	case <-ctx.Done():
+		return
+	case <-wp.stopChan:
+		return
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			_ = RunCommunityDetection(ctx, wp.Store, wp.LLM)
+		case <-ctx.Done():
+			log.Println("[Worker Pool] Stopping background Community GraphRAG Detection loop (Context cancelled)")
+			return
+		case <-wp.stopChan:
+			log.Println("[Worker Pool] Stopping background Community GraphRAG Detection loop (Pool stopped)")
+			return
+		}
+	}
+}
+
+func (wp *WorkerPool) reflectionLoop(ctx context.Context) {
+	interval := 30 * time.Minute
+	if val := os.Getenv("REFLECTION_INTERVAL"); val != "" {
+		if parsed, err := time.ParseDuration(val); err == nil && parsed > 0 {
+			interval = parsed
+		}
+	}
+
+	log.Printf("[Worker Pool] Started background Cognitive Reflection loop (Interval: %v)", interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Initial warmup delay before running the first scan (2 minutes to let entities settle)
+	select {
+	case <-time.After(2 * time.Minute):
+		_ = RunCognitiveReflection(ctx, wp.Store, wp.LLM)
+	case <-ctx.Done():
+		return
+	case <-wp.stopChan:
+		return
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			_ = RunCognitiveReflection(ctx, wp.Store, wp.LLM)
+		case <-ctx.Done():
+			log.Println("[Worker Pool] Stopping background Cognitive Reflection loop (Context cancelled)")
+			return
+		case <-wp.stopChan:
+			log.Println("[Worker Pool] Stopping background Cognitive Reflection loop (Pool stopped)")
+			return
+		}
 	}
 }
 
@@ -175,6 +293,21 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 				wgFacts.Add(1)
 				go func(ext agent.ExtractedFact) {
 					defer wgFacts.Done()
+
+					// Run logical conflict validator against other active facts of this entity
+					validator := NewConflictValidator(wp.LLM, wp.Store)
+					conflictRes, conflictingFact, err := validator.CheckConflict(ctx, job.EntityID, ext, activeFacts)
+					if err == nil && conflictRes != nil && conflictRes.HasConflict {
+						log.Printf("[Worker %d] Logical conflict detected for candidate [%s: %s] against active facts. Reason: %s", 
+							workerID, ext.Attribute, ext.Value, conflictRes.Reason)
+						if conflictingFact != nil {
+							log.Printf("[Worker %d] Deactivating conflicting fact [%s: %s] (ID: %s) to resolve contradiction",
+								workerID, conflictingFact.Attribute, conflictingFact.Value, conflictingFact.ID)
+							if err := wp.Store.DeactivateFact(ctx, conflictingFact.ID); err != nil {
+								log.Printf("[Worker %d] Error deactivating conflicting fact: %v", workerID, err)
+							}
+						}
+					}
 
 					representation := fmt.Sprintf("%s: %s", ext.Attribute, ext.Value)
 

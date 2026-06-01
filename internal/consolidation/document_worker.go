@@ -216,9 +216,8 @@ func (wp *WorkerPool) extractCognitiveGraph(ctx context.Context, workerID int, d
 				SourceAgent:     "document:" + docID.String(),
 			}
 
-			if err := wp.Store.InsertFact(bgCtx, newFact, embedding); err == nil {
-				// Establish explicit provenance graph links
-				_ = wp.Store.LinkFactToSource(bgCtx, factID, docID, chunk.ID)
+			if err := wp.Store.InsertFactWithProvenance(bgCtx, newFact, embedding, docID, chunk.ID); err != nil {
+				log.Printf("[Cognitive Extraction %d] Error inserting fact with provenance: %v", workerID, err)
 			}
 		}
 

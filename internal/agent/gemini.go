@@ -189,6 +189,8 @@ func (c *GeminiClient) ExtractRelations(ctx context.Context, message string) ([]
 If "Conversation Context" is provided, use it ONLY to resolve references (such as pronouns like "she", "he", "it", "they" or relative references) to their actual entities.
 CRITICAL: Do NOT extract any relationships that were already established or discussed in the "Conversation Context". Focus EXCLUSIVELY on extracting NEW structural relationships mentioned in the "Message to process".
 
+CRITICAL: Do NOT extract generic relative nouns, pronouns or common nouns as distinct target or source entities (for example, do NOT extract: "amigo", "friend", "cocinero", "él", "ella", "mi amigo", "speaker", "person"). Entities must be specific proper names (e.g. "Juan", "Alice", "Bayer", "Google") or explicit entities, never generic common nouns.
+
 Analyze the message and extract any structural relationships between the speaker (user/subject) and other distinct entities mentioned, OR between any of the entities mentioned in the text.
 Only extract relationships that represent a long-term connection. Do not extract transient actions.
 
@@ -236,4 +238,50 @@ Input:
 	}
 
 	return extracted, nil
+}
+
+// ValidateConflict analiza un hecho candidato contra hechos existentes para identificar contradicciones lógicas.
+func (c *GeminiClient) ValidateConflict(ctx context.Context, candidate string, existing []string) (string, error) {
+	existingStr := "None"
+	if len(existing) > 0 {
+		existingStr = strings.Join(existing, "\n")
+	}
+
+	prompt := fmt.Sprintf(`You are a logical validation engine.
+Analyze the "Candidate Fact" against the list of "Existing Active Facts" for the same entity.
+Determine if there is a direct logical contradiction or mutually exclusive conflict between the candidate and any of the existing facts.
+
+Format the output strictly as a raw JSON object. Do not include markdown code block formatting (like json). Just output raw JSON.
+The JSON object must contain:
+- "has_conflict": boolean (true if there is a logical contradiction/conflict, false otherwise)
+- "conflicting_fact": string (specify the exact conflicting fact value from the existing list, or empty if none)
+- "reason": string (brief explanation of the contradiction, or empty if none)
+
+Candidate Fact:
+%s
+
+Existing Active Facts:
+%s`, candidate, existingStr)
+
+	resp, err := c.genModel.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		return "", fmt.Errorf("failed to validate conflict: %w", err)
+	}
+
+	if len(resp.Candidates) == 0 || resp.Candidates[0].Content == nil || len(resp.Candidates[0].Content.Parts) == 0 {
+		return `{"has_conflict": false}`, nil
+	}
+
+	var jsonBuilder strings.Builder
+	for _, part := range resp.Candidates[0].Content.Parts {
+		if textPart, ok := part.(genai.Text); ok {
+			jsonBuilder.WriteString(string(textPart))
+		}
+	}
+
+	cleaned := strings.TrimSpace(jsonBuilder.String())
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	return strings.TrimSpace(cleaned), nil
 }

@@ -726,3 +726,28 @@ func (s *Neo4jStore) LinkFactToSource(ctx context.Context, factID uuid.UUID, doc
 	return nil
 }
 
+func (s *Neo4jStore) GetAllEntities(ctx context.Context) ([]EntityNode, error) {
+	return nil, nil
+}
+
+func (s *Neo4jStore) MergeEntities(ctx context.Context, canonicalID, duplicateID uuid.UUID) error {
+	return nil
+}
+
+func (s *Neo4jStore) InsertFactWithProvenance(ctx context.Context, fact *Fact, vector []float32, docID uuid.UUID, chunkID uuid.UUID) error {
+	if err := s.InsertFact(ctx, fact, vector); err != nil {
+		return err
+	}
+	return s.LinkFactToSource(ctx, fact.ID, docID, chunkID)
+}
+
+func (s *Neo4jStore) InsertCommunitySummary(ctx context.Context, id uuid.UUID, name string, summary string, embedding []float32, entities []uuid.UUID) error {
+	return nil
+}
+
+func (s *Neo4jStore) SearchCommunitySummaries(ctx context.Context, queryVector []float32, limit int) ([]CommunitySummary, error) {
+	return nil, nil
+}
+
+
+
