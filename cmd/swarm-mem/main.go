@@ -31,6 +31,7 @@ type Server struct {
 	LLM        agent.LLMClient
 	Filter     *privacy.LocalPrivacyFilter
 	WorkerPool *consolidation.WorkerPool
+	Cache      memory.SemanticCache
 }
 
 type ChatRequest struct {
@@ -213,6 +214,20 @@ func main() {
 	}
 	defer chatMemory.Close()
 
+	// 3c. Initialize Semantic Cache using the factory
+	semanticCacheThreshold := 0.95
+	if val := os.Getenv("SEMANTIC_CACHE_THRESHOLD"); val != "" {
+		if parsed, err := strconv.ParseFloat(val, 64); err == nil && parsed > 0 {
+			semanticCacheThreshold = parsed
+		}
+	}
+	log.Printf("Initializing Semantic Cache (Provider: %s, threshold: %.2f)...", chatMemProvider, semanticCacheThreshold)
+	semanticCache, err := memory.NewSemanticCacheFactory(chatMemProvider, chatMemURL, semanticCacheThreshold)
+	if err != nil {
+		log.Fatalf("Semantic Cache initialization failed: %v", err)
+	}
+	defer semanticCache.Close()
+
 	workerPool := consolidation.NewWorkerPool(store, chatMemory, llmClient, queueSize, maxWorkers)
 	workerPool.Start(ctx)
 	defer workerPool.Stop()
@@ -223,6 +238,7 @@ func main() {
 		LLM:        llmClient,
 		Filter:     filter,
 		WorkerPool: workerPool,
+		Cache:      semanticCache,
 	}
 
 	// 5. Define routes
@@ -313,6 +329,35 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		queryVector = nil
 	}
 
+	// 2b. Check Semantic Cache for hits (Cos similarity >= 0.95)
+	if len(queryVector) > 0 {
+		cachedReply, found, err := s.Cache.Get(ctx, queryVector)
+		if err == nil && found {
+			log.Printf("[Semantic Cache HIT] Returning cached response directly for query: %s", cleanMessage)
+			// Append cache turn to short-term chat memory to keep session state updated
+			userMsg := memory.ChatMessage{
+				Role:      req.AgentRole,
+				Content:   cleanMessage,
+				Timestamp: time.Now(),
+			}
+			_ = s.ChatMemory.AppendMessage(ctx, sessionID, userMsg)
+
+			assistantMsg := memory.ChatMessage{
+				Role:      "assistant",
+				Content:   cachedReply,
+				Timestamp: time.Now(),
+			}
+			_ = s.ChatMemory.AppendMessage(ctx, sessionID, assistantMsg)
+
+			// Respond to caller immediately
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(ChatResponse{
+				ResponseMessage: cachedReply,
+			})
+			return
+		}
+	}
+
 	// 3. Search database for active facts (Hybrid Search)
 	searchQuery := &memory.MemorySearchQuery{
 		QueryText:     cleanMessage,
@@ -376,6 +421,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		} else {
 			log.Printf("Document chunks retrieval error: %v", err)
 		}
+
+		// 4c. Retrieve community summaries for Macro-Narrative GraphRAG context
+		communities, err := s.Store.SearchCommunitySummaries(ctx, queryVector, 2)
+		if err == nil {
+			for _, comm := range communities {
+				filteredFacts = append(filteredFacts, memory.Fact{
+					ID:              comm.ID,
+					EntityID:        sharedEntityID,
+					Attribute:       "macro_narrative",
+					Value:           fmt.Sprintf("[Macro Narrative Summary: %s] %s", comm.Name, comm.Summary),
+					ConfidenceScore: 1.0,
+					SourceAgent:     "community_graphrag",
+				})
+			}
+		} else {
+			log.Printf("Community summaries retrieval error: %v", err)
+		}
 	}
 
 	// 4b. Retrieve 1-hop and 2-hop active relationships for Graph Context (Graph RAG)
@@ -388,59 +450,108 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			entityIDs[r.TargetID] = true
 		}
 
-		// Fetch 2-hop relations for connected entities
-		var hop2Rels []memory.Relation
-		for _, r := range rels {
-			otherID := r.TargetID
-			if otherID != entityID {
-				otherRels, err := s.Store.GetActiveRelations(ctx, otherID)
+		var nameMap map[uuid.UUID]string
+		if pgStore, ok := s.Store.(*memory.PGStore); ok {
+			// Optimized path: batch fetch 2-hop relations in 1 query
+			otherIDsMap := make(map[uuid.UUID]bool)
+			for _, r := range rels {
+				otherID := r.TargetID
+				if otherID != entityID {
+					otherIDsMap[otherID] = true
+				}
+			}
+			var otherIDs []uuid.UUID
+			for oid := range otherIDsMap {
+				otherIDs = append(otherIDs, oid)
+			}
+			if len(otherIDs) > 0 {
+				otherRels, err := pgStore.GetActiveRelationsBatch(ctx, otherIDs)
 				if err == nil {
 					for _, or := range otherRels {
 						entityIDs[or.SourceID] = true
 						entityIDs[or.TargetID] = true
-						hop2Rels = append(hop2Rels, or)
+						rels = append(rels, or)
 					}
-				}
-			}
-		}
-		rels = append(rels, hop2Rels...)
-
-		// Resolve human-readable names for all entity IDs
-		nameMap := make(map[uuid.UUID]string)
-		nameMap[entityID] = "user" // Speaker is mapped to "user"
-
-		for eID := range entityIDs {
-			if eID == entityID {
-				continue
-			}
-			// Search for "name" fact of this entity to map UUID -> human name
-			facts, err := s.Store.SearchHybrid(ctx, &memory.MemorySearchQuery{
-				TargetEntity: eID,
-				MaxResults:   20,
-			})
-			if err == nil {
-				for _, f := range facts {
-					if f.Attribute == "name" {
-						nameMap[eID] = f.Value
-						break
-					}
-				}
-			}
-			if _, exists := nameMap[eID]; !exists {
-				if len(facts) > 0 {
-					nameMap[eID] = facts[0].Value
 				} else {
-					nameMap[eID] = eID.String()[:8]
+					log.Printf("Failed to batch get 2-hop active relations: %v", err)
+				}
+			}
+
+			// Batch resolve names in 1 query
+			var eIDs []uuid.UUID
+			for eID := range entityIDs {
+				if eID != entityID {
+					eIDs = append(eIDs, eID)
+				}
+			}
+			nameMap, err = pgStore.GetEntityNamesBatch(ctx, eIDs)
+			if err != nil {
+				log.Printf("Failed to batch get entity names: %v", err)
+				nameMap = make(map[uuid.UUID]string)
+			}
+		} else {
+			// Fallback path: standard 2-hop relation traversal
+			var hop2Rels []memory.Relation
+			for _, r := range rels {
+				otherID := r.TargetID
+				if otherID != entityID {
+					otherRels, err := s.Store.GetActiveRelations(ctx, otherID)
+					if err == nil {
+						for _, or := range otherRels {
+							entityIDs[or.SourceID] = true
+							entityIDs[or.TargetID] = true
+							hop2Rels = append(hop2Rels, or)
+						}
+					}
+				}
+			}
+			rels = append(rels, hop2Rels...)
+
+			// Fallback path: standard sequential name resolution
+			nameMap = make(map[uuid.UUID]string)
+			for eID := range entityIDs {
+				if eID == entityID {
+					continue
+				}
+				facts, err := s.Store.SearchHybrid(ctx, &memory.MemorySearchQuery{
+					TargetEntity: eID,
+					MaxResults:   20,
+				})
+				if err == nil {
+					for _, f := range facts {
+						if f.Attribute == "name" {
+							nameMap[eID] = f.Value
+							break
+						}
+					}
+				}
+				if _, exists := nameMap[eID]; !exists {
+					if len(facts) > 0 {
+						nameMap[eID] = facts[0].Value
+					} else {
+						nameMap[eID] = eID.String()[:8]
+					}
 				}
 			}
 		}
+
+		if nameMap == nil {
+			nameMap = make(map[uuid.UUID]string)
+		}
+		nameMap[entityID] = "user" // Speaker is mapped to "user"
 
 		// Deduplicate and format relations as artificial Graph Relation facts
 		seenRels := make(map[string]bool)
 		for _, r := range rels {
 			srcName := nameMap[r.SourceID]
 			tgtName := nameMap[r.TargetID]
-			if srcName == "" || tgtName == "" || srcName == tgtName {
+			if srcName == "" {
+				srcName = r.SourceID.String()[:8]
+			}
+			if tgtName == "" {
+				tgtName = r.TargetID.String()[:8]
+			}
+			if srcName == tgtName {
 				continue
 			}
 			relKey := fmt.Sprintf("%s-%s-%s", srcName, r.Type, tgtName)
@@ -468,6 +579,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("LLM generation error: %v", err)
 		http.Error(w, "Failed to generate answer from model", http.StatusInternalServerError)
 		return
+	}
+
+	// 5b. Register response in semantic cache asynchronously
+	if len(queryVector) > 0 && err == nil {
+		go func(qText string, qVec []float32, rText string) {
+			_ = s.Cache.Set(context.Background(), qText, qVec, rText)
+		}(cleanMessage, queryVector, reply)
 	}
 
 	// 5b. Append interaction turn to short-term chat memory

@@ -46,6 +46,9 @@ type LLMClient interface {
 	// ExtractRelations parses raw conversation text to extract structural relationships to other entities
 	ExtractRelations(ctx context.Context, message string) ([]ExtractedRelation, error)
 
+	// ValidateConflict analiza un hecho candidato contra hechos existentes para identificar contradicciones lógicas.
+	ValidateConflict(ctx context.Context, candidate string, existing []string) (string, error)
+
 	// Close terminates the client and cleans up any open connections/resources
 	Close()
 }

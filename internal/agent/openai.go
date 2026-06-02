@@ -318,6 +318,8 @@ func (c *OpenAIClient) ExtractRelations(ctx context.Context, message string) ([]
 If "Conversation Context" is provided, use it ONLY to resolve references (such as pronouns like "she", "he", "it", "they" or relative references) to their actual entities.
 CRITICAL: Do NOT extract any relationships that were already established or discussed in the "Conversation Context". Focus EXCLUSIVELY on extracting NEW structural relationships mentioned in the "Message to process".
 
+CRITICAL: Do NOT extract generic relative nouns, pronouns or common nouns as distinct target or source entities (for example, do NOT extract: "amigo", "friend", "cocinero", "él", "ella", "mi amigo", "speaker", "person"). Entities must be specific proper names (e.g. "Juan", "Alice", "Bayer", "Google") or explicit entities, never generic common nouns.
+
 Analyze the message and extract any structural relationships between the speaker (user/subject) and other distinct entities mentioned, OR between any of the entities mentioned in the text.
 Only extract relationships that represent a long-term connection. Do not extract transient actions.
 
@@ -398,3 +400,82 @@ Input:
 
 	return extracted, nil
 }
+
+// ValidateConflict analiza un hecho candidato contra hechos existentes para identificar contradicciones lógicas.
+func (c *OpenAIClient) ValidateConflict(ctx context.Context, candidate string, existing []string) (string, error) {
+	existingStr := "None"
+	if len(existing) > 0 {
+		existingStr = strings.Join(existing, "\n")
+	}
+
+	prompt := fmt.Sprintf(`You are a logical validation engine.
+Analyze the "Candidate Fact" against the list of "Existing Active Facts" for the same entity.
+Determine if there is a direct logical contradiction or mutually exclusive conflict between the candidate and any of the existing facts.
+
+Format the output strictly as a raw JSON object. Do not include markdown code block formatting (like json). Just output raw JSON.
+The JSON object must contain:
+- "has_conflict": boolean (true if there is a logical contradiction/conflict, false otherwise)
+- "conflicting_fact": string (specify the exact conflicting fact value from the existing list, or empty if none)
+- "reason": string (brief explanation of the contradiction, or empty if none)
+
+Candidate Fact:
+%s
+
+Existing Active Facts:
+%s`, candidate, existingStr)
+
+	reqBody, err := json.Marshal(map[string]interface{}{
+		"model": c.genModelName,
+		"messages": []map[string]string{
+			{
+				"role":    "user",
+				"content": prompt,
+			},
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal conflict validation request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("failed to create conflict validation request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("conflict validation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("openai conflict validation API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var res struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return "", fmt.Errorf("failed to decode conflict validation response: %w", err)
+	}
+
+	if len(res.Choices) == 0 {
+		return "", fmt.Errorf("openai conflict validation API returned zero choices")
+	}
+
+	cleaned := strings.TrimSpace(res.Choices[0].Message.Content)
+	cleaned = strings.TrimPrefix(cleaned, "```json")
+	cleaned = strings.TrimPrefix(cleaned, "```")
+	cleaned = strings.TrimSuffix(cleaned, "```")
+	return strings.TrimSpace(cleaned), nil
+}
+

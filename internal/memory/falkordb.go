@@ -840,3 +840,28 @@ func (s *FalkorDBStore) LinkFactToSource(ctx context.Context, factID uuid.UUID, 
 	return nil
 }
 
+func (s *FalkorDBStore) GetAllEntities(ctx context.Context) ([]EntityNode, error) {
+	return nil, nil
+}
+
+func (s *FalkorDBStore) MergeEntities(ctx context.Context, canonicalID, duplicateID uuid.UUID) error {
+	return nil
+}
+
+func (s *FalkorDBStore) InsertFactWithProvenance(ctx context.Context, fact *Fact, vector []float32, docID uuid.UUID, chunkID uuid.UUID) error {
+	if err := s.InsertFact(ctx, fact, vector); err != nil {
+		return err
+	}
+	return s.LinkFactToSource(ctx, fact.ID, docID, chunkID)
+}
+
+func (s *FalkorDBStore) InsertCommunitySummary(ctx context.Context, id uuid.UUID, name string, summary string, embedding []float32, entities []uuid.UUID) error {
+	return nil
+}
+
+func (s *FalkorDBStore) SearchCommunitySummaries(ctx context.Context, queryVector []float32, limit int) ([]CommunitySummary, error) {
+	return nil, nil
+}
+
+
+
