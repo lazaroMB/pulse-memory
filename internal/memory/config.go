@@ -2,20 +2,11 @@ package memory
 
 import "time"
 
-// Config contains the environment configuration variables for all supported database providers.
+// Config contains the environment configuration variables for the ArcadeDB provider.
 type Config struct {
-	Provider    string        // "postgres", "neo4j", "falkordb"
-	Timeout     time.Duration // General request timeout
-
-	// PostgreSQL
-	PostgresURL string
-
-	// Neo4j
-	Neo4jURI      string
-	Neo4jUsername string
-	Neo4jPassword string
-
-	// FalkorDB
-	FalkorDBURL       string
-	FalkorDBGraphName string
+	URL      string        // e.g. "http://localhost:2480"
+	Database string        // e.g. "pulse"
+	Username string
+	Password string
+	Timeout  time.Duration // General request timeout
 }

@@ -95,7 +95,7 @@ func TestProcessJobHistoryFiltering(t *testing.T) {
 	chatMemory := memory.NewInMemoryChatMemory()
 	llm := &recordingLLMClient{}
 
-	wp := NewWorkerPool(store, chatMemory, llm, 10, 1)
+	wp := NewWorkerPool(store, chatMemory, llm, nil, 10, 1)
 
 	sessionID := "test-session"
 	entityID := uuid.New()

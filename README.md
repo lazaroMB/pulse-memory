@@ -2,15 +2,15 @@
 
 A high-performance, low-latency long-term memory layer for AI agents and multi-agent swarms written in **Golang**. This system fuses semantic vector search, temporal relational schemas, and asynchronous cognitive processing to enable autonomous agents to maintain state, recall user preferences, and resolve conflicts over time.
 
-Pulse is built using a provider-agnostic database abstraction layer that natively supports **PostgreSQL**, **Neo4j**, and **FalkorDB** properties.
+Pulse is built using a database abstraction layer that natively supports **ArcadeDB**.
 
 ---
 
 ## Key Features
 
-* **Abstract Memory Store Layer:** Exposes a unified database factory supporting three distinct storage backends. Switch providers on the fly using a single environment variable.
+* **Memory Store Layer:** Exposes a unified database interface supporting **ArcadeDB** as its storage backend.
 * **Temporal Relational Storage:** Implements database models with `valid_from` and `valid_until` parameters. Stale or contradictory facts are deactivated dynamically rather than deleted.
-* **Property Graph Data Mapping:** For graph providers (Neo4j, FalkorDB), facts and relations are mapped directly to native nodes (`:Entity`, `:Fact`) and relational edges (`:RELATION`) for low-latency graph traversals.
+* **Property Graph Data Mapping:** Facts and relations are mapped directly to native vertices (`Entity`, `Fact`) and relational edges (`RELATION`) in ArcadeDB for low-latency graph traversals.
 * **Provider-Agnostic LLM Abstraction Layer:** Native interface and connection factory supporting multiple model families. Seamlessly switch between **Google Gemini** (using the official Gen AI SDK) and **OpenAI** (via direct lightweight REST clients).
 * **Short-Term Chat Memory:** Supports transient, fast conversational history using Redis or an in-memory fallback. Automatically stores the last 50 messages per session with a 24-hour TTL (in Redis) to maintain session state across stateless HTTP requests.
 * **Decoupled Async Pipeline (Sleep-Time Pattern):** Separates fast, synchronous context retrieval (vector search) from heavy fact-extraction and summarization tasks. Main chats return in milliseconds, while background worker pools handle consolidation.
@@ -69,14 +69,12 @@ Pulse is built using a provider-agnostic database abstraction layer that nativel
 
 ## Prerequisites
 
-Ensure you have installed at least one of the following storage options depending on your active `DB_PROVIDER`:
+Ensure you have installed ArcadeDB:
 
 * **Go Runtime:** Version 1.26 or higher.
 * **LLM API Key:** Get a key from [Google AI Studio](https://aistudio.google.com/) for Gemini, or [OpenAI Platform](https://platform.openai.com/) for OpenAI.
 * **Active Database Instance:**
-  * **PostgreSQL:** Version 15+ with the **`pgvector`** extension installed.
-  * **Neo4j:** Version 5.x+ (Bolt protocol).
-  * **FalkorDB / RedisGraph:** Redis-compatible instance running FalkorDB module capabilities.
+  * **ArcadeDB:** A running ArcadeDB server instance (HTTP API port 2480).
 * **Short-Term Chat Memory (Optional):** Redis server version 6.x+ or Valkey version 7.x+ (falls back to a thread-safe in-memory map if none is provided).
 
 ---
@@ -92,20 +90,11 @@ cp .env.example .env
 Open the `.env` file and configure the database provider along with your active LLM provider choice:
 
 ```env
-# Choose your active database provider: postgres | neo4j | falkordb
-DB_PROVIDER=postgres
-
-# PostgreSQL Connection Settings
-DATABASE_URL=postgres://user:password@hostname:5432/dbname?sslmode=require
-
-# Neo4j Graph Connection Settings
-NEO4J_URI=neo4j://localhost:7687
-NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=password
-
-# FalkorDB / Redis Graph Connection Settings
-FALKORDB_URL=localhost:6379
-FALKORDB_GRAPH_NAME=swarm_memory
+# ArcadeDB Graph/Document Database Settings
+ARCADEDB_URL=http://localhost:2480
+ARCADEDB_DATABASE=pulse
+ARCADEDB_USERNAME=root
+ARCADEDB_PASSWORD=playwithdata
 
 # Choose your active LLM provider: gemini | openai
 LLM_PROVIDER=gemini

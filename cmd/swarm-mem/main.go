@@ -50,9 +50,10 @@ type ChatResponse struct {
 }
 
 type RelationRequest struct {
-	SourceID string `json:"source_id"`
-	TargetID string `json:"target_id"`
-	Type     string `json:"type"`
+	SourceID   string `json:"source_id"`
+	TargetID   string `json:"target_id"`
+	Type       string `json:"type"`
+	AgentOwner string `json:"agent_owner"`
 }
 
 
@@ -68,14 +69,24 @@ func main() {
 		_ = godotenv.Load(filepath.Join(filepath.Dir(execDir), ".env"))
 	}
 
-	dbProvider := os.Getenv("DB_PROVIDER")
-	if dbProvider == "" {
-		dbProvider = "postgres"
+	arcadeURL := os.Getenv("ARCADEDB_URL")
+	if arcadeURL == "" {
+		arcadeURL = "http://localhost:2480"
 	}
 
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbProvider == "postgres" && dbURL == "" {
-		log.Fatal("DATABASE_URL environment variable is required when DB_PROVIDER is 'postgres'.")
+	arcadeDB := os.Getenv("ARCADEDB_DATABASE")
+	if arcadeDB == "" {
+		arcadeDB = "pulse"
+	}
+
+	arcadeUser := os.Getenv("ARCADEDB_USERNAME")
+	if arcadeUser == "" {
+		arcadeUser = "root"
+	}
+
+	arcadePass := os.Getenv("ARCADEDB_PASSWORD")
+	if arcadePass == "" {
+		arcadePass = "playwithdata"
 	}
 
 	port := os.Getenv("PORT")
@@ -88,16 +99,13 @@ func main() {
 
 	// 2. Initialize database store using the factory
 	cfg := memory.Config{
-		Provider:          dbProvider,
-		PostgresURL:       dbURL,
-		Neo4jURI:          os.Getenv("NEO4J_URI"),
-		Neo4jUsername:     os.Getenv("NEO4J_USERNAME"),
-		Neo4jPassword:     os.Getenv("NEO4J_PASSWORD"),
-		FalkorDBURL:       os.Getenv("FALKORDB_URL"),
-		FalkorDBGraphName: os.Getenv("FALKORDB_GRAPH_NAME"),
+		URL:      arcadeURL,
+		Database: arcadeDB,
+		Username: arcadeUser,
+		Password: arcadePass,
 	}
 
-	log.Printf("Connecting to database using provider: %s...", dbProvider)
+	log.Printf("Connecting to ArcadeDB database: %s at %s...", arcadeDB, arcadeURL)
 	store, err := memory.NewMemoryStore(cfg)
 	if err != nil {
 		log.Fatalf("Database connection failed: %v", err)
@@ -228,7 +236,7 @@ func main() {
 	}
 	defer semanticCache.Close()
 
-	workerPool := consolidation.NewWorkerPool(store, chatMemory, llmClient, queueSize, maxWorkers)
+	workerPool := consolidation.NewWorkerPool(store, chatMemory, llmClient, semanticCache, queueSize, maxWorkers)
 	workerPool.Start(ctx)
 	defer workerPool.Stop()
 
@@ -312,7 +320,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		sessionID = uuid.New().String()
 	}
 
-	ctx := r.Context()
+	ctx := memory.WithAgentOwner(r.Context(), entityID)
 
 	// 1. Apply Local Privacy Filter (PII Scrubbing Proxy)
 	cleanMessage, err := s.Filter.ScrubText(ctx, req.Message)
@@ -364,6 +372,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		QueryVector:   queryVector,
 		TargetEntity:  entityID,
 		RequiredScope: req.AgentRole,
+		AgentOwner:    entityID,
 		MaxResults:    5,
 	}
 
@@ -380,6 +389,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		QueryVector:   queryVector,
 		TargetEntity:  sharedEntityID,
 		RequiredScope: req.AgentRole,
+		AgentOwner:    entityID,
 		MaxResults:    5,
 	}
 
@@ -451,7 +461,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 
 		var nameMap map[uuid.UUID]string
-		if pgStore, ok := s.Store.(*memory.PGStore); ok {
+		if arcadeStore, ok := s.Store.(*memory.ArcadeDBStore); ok {
 			// Optimized path: batch fetch 2-hop relations in 1 query
 			otherIDsMap := make(map[uuid.UUID]bool)
 			for _, r := range rels {
@@ -465,7 +475,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				otherIDs = append(otherIDs, oid)
 			}
 			if len(otherIDs) > 0 {
-				otherRels, err := pgStore.GetActiveRelationsBatch(ctx, otherIDs)
+				otherRels, err := arcadeStore.GetActiveRelationsBatch(ctx, otherIDs)
 				if err == nil {
 					for _, or := range otherRels {
 						entityIDs[or.SourceID] = true
@@ -484,7 +494,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 					eIDs = append(eIDs, eID)
 				}
 			}
-			nameMap, err = pgStore.GetEntityNamesBatch(ctx, eIDs)
+			nameMap, err = arcadeStore.GetEntityNamesBatch(ctx, eIDs)
 			if err != nil {
 				log.Printf("Failed to batch get entity names: %v", err)
 				nameMap = make(map[uuid.UUID]string)
@@ -543,6 +553,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Deduplicate and format relations as artificial Graph Relation facts
 		seenRels := make(map[string]bool)
 		for _, r := range rels {
+			if strings.ToUpper(r.Type) == "HAS_NAME" || strings.ToUpper(r.Type) == "NAME" {
+				continue
+			}
 			srcName := nameMap[r.SourceID]
 			tgtName := nameMap[r.TargetID]
 			if srcName == "" {
@@ -669,19 +682,31 @@ func (s *Server) handleRelation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
+	agentOwner := sourceUUID
+	if req.AgentOwner != "" {
+		if parsed, err := uuid.Parse(req.AgentOwner); err == nil {
+			agentOwner = parsed
+		}
+	}
+
+	ctx := memory.WithAgentOwner(r.Context(), agentOwner)
 	relation := &memory.Relation{
-		ID:        uuid.New(),
-		SourceID:  sourceUUID,
-		TargetID:  targetUUID,
-		Type:      req.Type,
-		ValidFrom: time.Now(),
+		ID:         uuid.New(),
+		SourceID:   sourceUUID,
+		TargetID:   targetUUID,
+		Type:       req.Type,
+		AgentOwner: agentOwner,
+		ValidFrom:  time.Now(),
 	}
 
 	if err := s.Store.InsertRelation(ctx, relation); err != nil {
 		log.Printf("Failed to insert relation: %v", err)
 		http.Error(w, "Failed to store relation", http.StatusInternalServerError)
 		return
+	}
+
+	if s.Cache != nil {
+		_ = s.Cache.Invalidate(ctx, agentOwner)
 	}
 
 	w.Header().Set("Content-Type", "application/json")

@@ -28,17 +28,19 @@ type WorkerPool struct {
 	Store         memory.MemoryStore
 	ChatMemory    memory.ChatMemory
 	LLM           agent.LLMClient
+	Cache         memory.SemanticCache
 	MaxWorkers    int
 	stopChan      chan struct{}
 }
 
-func NewWorkerPool(store memory.MemoryStore, chatMemory memory.ChatMemory, llm agent.LLMClient, queueSize int, maxWorkers int) *WorkerPool {
+func NewWorkerPool(store memory.MemoryStore, chatMemory memory.ChatMemory, llm agent.LLMClient, cache memory.SemanticCache, queueSize int, maxWorkers int) *WorkerPool {
 	return &WorkerPool{
 		JobQueue:      make(chan InteractionLog, queueSize),
 		DocumentQueue: make(chan DocumentJob, queueSize),
 		Store:         store,
 		ChatMemory:    chatMemory,
 		LLM:           llm,
+		Cache:         cache,
 		MaxWorkers:    maxWorkers,
 		stopChan:      make(chan struct{}),
 	}
@@ -192,6 +194,8 @@ func (wp *WorkerPool) worker(ctx context.Context, id int) {
 func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job InteractionLog) {
 	log.Printf("[Worker %d] Ingesting message from session %s for fact & relation extraction", workerID, job.SessionID)
 
+	ctx = memory.WithAgentOwner(ctx, job.EntityID)
+
 	// Fetch conversational context from short-term memory
 	history, err := wp.ChatMemory.GetSessionHistory(ctx, job.SessionID, 10)
 	if err != nil {
@@ -326,6 +330,7 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 						ValidFrom:       time.Now(),
 						ValidUntil:      nil,
 						SourceAgent:     job.Sender,
+						AgentOwner:      job.EntityID,
 					}
 
 					if err := wp.Store.InsertFact(ctx, newFact, embedding); err != nil {
@@ -375,6 +380,7 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 							ConfidenceScore: 1.0,
 							ValidFrom:       time.Now(),
 							SourceAgent:     job.Sender,
+							AgentOwner:      job.EntityID,
 						}, targetEmb)
 					}
 				}
@@ -399,6 +405,7 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 							ConfidenceScore: 1.0,
 							ValidFrom:       time.Now(),
 							SourceAgent:     job.Sender,
+							AgentOwner:      job.EntityID,
 						}, sourceEmb)
 					}
 				}
@@ -416,11 +423,12 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 				}
 
 				relation := &memory.Relation{
-					ID:        uuid.New(),
-					SourceID:  sourceID,
-					TargetID:  targetID,
-					Type:      strings.ToUpper(strings.TrimSpace(rel.RelationType)),
-					ValidFrom: time.Now(),
+					ID:         uuid.New(),
+					SourceID:   sourceID,
+					TargetID:   targetID,
+					Type:       strings.ToUpper(strings.TrimSpace(rel.RelationType)),
+					AgentOwner: job.EntityID,
+					ValidFrom:  time.Now(),
 				}
 
 				if err := wp.Store.InsertRelation(ctx, relation); err != nil {
@@ -436,6 +444,15 @@ func (wp *WorkerPool) processJob(ctx context.Context, workerID int, job Interact
 		wgRels.Wait()
 	} else {
 		log.Printf("[Worker %d] No relationships found in message.", workerID)
+	}
+
+	// Invalidate semantic cache for the agent owner as new facts/relations have been consolidated
+	if wp.Cache != nil {
+		if err := wp.Cache.Invalidate(ctx, job.EntityID); err != nil {
+			log.Printf("[Worker %d] Error invalidating semantic cache for owner %s: %v", workerID, job.EntityID, err)
+		} else {
+			log.Printf("[Worker %d] Semantic cache invalidated for owner %s", workerID, job.EntityID)
+		}
 	}
 }
 

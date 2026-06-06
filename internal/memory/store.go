@@ -21,6 +21,7 @@ type Fact struct {
 	MemoryStrength  float64    `db:"memory_strength" json:"memory_strength"`
 	Stability       float64    `db:"stability" json:"stability"`
 	LastAccessed    time.Time  `db:"last_accessed" json:"last_accessed"`
+	AgentOwner      uuid.UUID  `db:"agent_owner" json:"agent_owner,omitempty"`
 }
 
 // Relation represents an edge in the temporal knowledge graph connecting two entities.
@@ -34,6 +35,7 @@ type Relation struct {
 	MemoryStrength float64    `db:"memory_strength" json:"memory_strength"`
 	Stability      float64    `db:"stability" json:"stability"`
 	LastAccessed   time.Time  `db:"last_accessed" json:"last_accessed"`
+	AgentOwner     uuid.UUID  `db:"agent_owner" json:"agent_owner,omitempty"`
 }
 
 // MemorySearchQuery represents the input parameters for a hybrid search.
@@ -43,6 +45,20 @@ type MemorySearchQuery struct {
 	TargetEntity  uuid.UUID
 	RequiredScope string
 	MaxResults    int
+	AgentOwner    uuid.UUID
+}
+
+type contextKey string
+
+const AgentOwnerKey contextKey = "agent_owner"
+
+func WithAgentOwner(ctx context.Context, ownerID uuid.UUID) context.Context {
+	return context.WithValue(ctx, AgentOwnerKey, ownerID)
+}
+
+func GetAgentOwner(ctx context.Context) (uuid.UUID, bool) {
+	val, ok := ctx.Value(AgentOwnerKey).(uuid.UUID)
+	return val, ok
 }
 
 // MemoryStore defines the boundary for database writes and hybrid lookups.

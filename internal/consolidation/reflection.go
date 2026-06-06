@@ -46,7 +46,7 @@ func RunCognitiveReflection(ctx context.Context, store memory.MemoryStore, llm a
 		// Fetch active facts
 		facts, err := store.SearchHybrid(ctx, &memory.MemorySearchQuery{
 			TargetEntity: ent.ID,
-			MaxResults:   30,
+			MaxResults:   100, // Fetch more to allow proper grouping
 		})
 		if err != nil || len(facts) < 2 {
 			continue // Skip entities with insufficient known context
@@ -58,25 +58,55 @@ func RunCognitiveReflection(ctx context.Context, store memory.MemoryStore, llm a
 			rels = []memory.Relation{}
 		}
 
-		var factsStr strings.Builder
+		// Group facts by AgentOwner
+		factsByOwner := make(map[uuid.UUID][]memory.Fact)
 		for _, f := range facts {
-			factsStr.WriteString(fmt.Sprintf("- Attribute '%s': %s\n", f.Attribute, f.Value))
+			factsByOwner[f.AgentOwner] = append(factsByOwner[f.AgentOwner], f)
 		}
 
-		var relsStr strings.Builder
+		// Group relations by AgentOwner
+		relsByOwner := make(map[uuid.UUID][]memory.Relation)
 		for _, r := range rels {
-			targetName := r.TargetID.String()
-			if tNode, ok := entityMap[r.TargetID]; ok {
-				targetName = tNode.Name
-			}
-			sourceName := r.SourceID.String()
-			if sNode, ok := entityMap[r.SourceID]; ok {
-				sourceName = sNode.Name
-			}
-			relsStr.WriteString(fmt.Sprintf("- %s -> %s (%s)\n", sourceName, targetName, r.Type))
+			relsByOwner[r.AgentOwner] = append(relsByOwner[r.AgentOwner], r)
 		}
 
-		prompt := fmt.Sprintf(`You are a deep cognitive reflection engine.
+		for ownerID, ownerFacts := range factsByOwner {
+			// Each agent owner gets to reflect on its own private facts plus shared general facts
+			var reflectionFacts []memory.Fact
+			reflectionFacts = append(reflectionFacts, ownerFacts...)
+			if ownerID != uuid.Nil {
+				reflectionFacts = append(reflectionFacts, factsByOwner[uuid.Nil]...)
+			}
+
+			if len(reflectionFacts) < 2 {
+				continue
+			}
+
+			var reflectionRels []memory.Relation
+			reflectionRels = append(reflectionRels, relsByOwner[ownerID]...)
+			if ownerID != uuid.Nil {
+				reflectionRels = append(reflectionRels, relsByOwner[uuid.Nil]...)
+			}
+
+			var factsStr strings.Builder
+			for _, f := range reflectionFacts {
+				factsStr.WriteString(fmt.Sprintf("- Attribute '%s': %s\n", f.Attribute, f.Value))
+			}
+
+			var relsStr strings.Builder
+			for _, r := range reflectionRels {
+				targetName := r.TargetID.String()
+				if tNode, ok := entityMap[r.TargetID]; ok {
+					targetName = tNode.Name
+				}
+				sourceName := r.SourceID.String()
+				if sNode, ok := entityMap[r.SourceID]; ok {
+					sourceName = sNode.Name
+				}
+				relsStr.WriteString(fmt.Sprintf("- %s -> %s (%s)\n", sourceName, targetName, r.Type))
+			}
+
+			prompt := fmt.Sprintf(`You are a deep cognitive reflection engine.
 Analyze the following active facts and relationships established for the entity "%s".
 Your goal is to perform logical deduction and synthesis to identify at least one implicit, new factual claim or connection that is logically derived from this context but not explicitly stated.
 
@@ -100,60 +130,63 @@ Each object must contain:
 
 If no valid logical deductions can be made, output an empty JSON array [].`, ent.Name, factsStr.String(), relsStr.String())
 
-		// Generate reflection using the LLM client
-		responseStr, err := llm.GenerateAnswer(ctx, prompt, nil, nil)
-		if err != nil {
-			log.Printf("[Reflection Engine] LLM generation failed for entity %s: %v", ent.Name, err)
-			continue
-		}
-
-		cleanedJSON := strings.TrimSpace(responseStr)
-		cleanedJSON = strings.TrimPrefix(cleanedJSON, "```json")
-		cleanedJSON = strings.TrimPrefix(cleanedJSON, "```")
-		cleanedJSON = strings.TrimSuffix(cleanedJSON, "```")
-		cleanedJSON = strings.TrimSpace(cleanedJSON)
-
-		if cleanedJSON == "" || cleanedJSON == "[]" {
-			continue
-		}
-
-		var insights []ReflectedInsight
-		if err := json.Unmarshal([]byte(cleanedJSON), &insights); err != nil {
-			log.Printf("[Reflection Engine] Failed to unmarshal insights (raw: %s): %v", cleanedJSON, err)
-			continue
-		}
-
-		for _, ins := range insights {
-			if ins.Attribute == "" || ins.Value == "" || ins.Confidence < 0.7 {
+			// Generate reflection using the LLM client
+			responseStr, err := llm.GenerateAnswer(ctx, prompt, nil, nil)
+			if err != nil {
+				log.Printf("[Reflection Engine] LLM generation failed for entity %s (owner: %s): %v", ent.Name, ownerID, err)
 				continue
 			}
 
-			// Generate embedding for the new derived fact representation
-			rep := fmt.Sprintf("%s: %s", ins.Attribute, ins.Value)
-			emb, err := llm.GenerateEmbedding(ctx, rep)
-			if err != nil {
+			cleanedJSON := strings.TrimSpace(responseStr)
+			cleanedJSON = strings.TrimPrefix(cleanedJSON, "```json")
+			cleanedJSON = strings.TrimPrefix(cleanedJSON, "```")
+			cleanedJSON = strings.TrimSuffix(cleanedJSON, "```")
+			cleanedJSON = strings.TrimSpace(cleanedJSON)
+
+			if cleanedJSON == "" || cleanedJSON == "[]" {
 				continue
 			}
 
-			factID := uuid.New()
-			newFact := &memory.Fact{
-				ID:              factID,
-				EntityID:        ent.ID,
-				Attribute:       ins.Attribute,
-				Value:           ins.Value,
-				ConfidenceScore: ins.Confidence,
-				ValidFrom:       time.Now(),
-				SourceAgent:     "reflection_engine",
-				Stability:       30.0, // Default stability for new reflections
+			var insights []ReflectedInsight
+			if err := json.Unmarshal([]byte(cleanedJSON), &insights); err != nil {
+				log.Printf("[Reflection Engine] Failed to unmarshal insights (raw: %s): %v", cleanedJSON, err)
+				continue
 			}
 
-			err = store.InsertFact(ctx, newFact, emb)
-			if err != nil {
-				log.Printf("[Reflection Engine] Error inserting reflected fact: %v", err)
-			} else {
-				log.Printf("[Reflection Engine] Deduced new implicit fact for '%s': [%s: %s] (Reason: %s)", 
-					ent.Name, ins.Attribute, ins.Value, ins.Explanation)
-				reflectedCount++
+			for _, ins := range insights {
+				if ins.Attribute == "" || ins.Value == "" || ins.Confidence < 0.7 {
+					continue
+				}
+
+				// Generate embedding for the new derived fact representation
+				rep := fmt.Sprintf("%s: %s", ins.Attribute, ins.Value)
+				emb, err := llm.GenerateEmbedding(ctx, rep)
+				if err != nil {
+					continue
+				}
+
+				factID := uuid.New()
+				newFact := &memory.Fact{
+					ID:              factID,
+					EntityID:        ent.ID,
+					Attribute:       ins.Attribute,
+					Value:           ins.Value,
+					ConfidenceScore: ins.Confidence,
+					ValidFrom:       time.Now(),
+					SourceAgent:     "reflection_engine",
+					Stability:       30.0, // Default stability for new reflections
+					AgentOwner:      ownerID,
+				}
+
+				ownerCtx := memory.WithAgentOwner(ctx, ownerID)
+				err = store.InsertFact(ownerCtx, newFact, emb)
+				if err != nil {
+					log.Printf("[Reflection Engine] Error inserting reflected fact: %v", err)
+				} else {
+					log.Printf("[Reflection Engine] Deduced new implicit fact for '%s' (owner: %s): [%s: %s] (Reason: %s)", 
+						ent.Name, ownerID, ins.Attribute, ins.Value, ins.Explanation)
+					reflectedCount++
+				}
 			}
 		}
 	}

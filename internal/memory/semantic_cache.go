@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gomodule/redigo/redis"
+	"github.com/google/uuid"
 )
 
 // CacheEntry representa un elemento guardado en la caché semántica.
@@ -19,18 +20,20 @@ type CacheEntry struct {
 	QueryVector  []float32 `json:"query_vector"`
 	ResponseText string    `json:"response_text"`
 	CreatedAt    time.Time `json:"created_at"`
+	AgentOwner   uuid.UUID `json:"agent_owner,omitempty"`
 }
 
 // SemanticCache define la interfaz para interactuar con la caché semántica.
 type SemanticCache interface {
 	Get(ctx context.Context, queryVector []float32) (string, bool, error)
 	Set(ctx context.Context, queryText string, queryVector []float32, responseText string) error
+	Invalidate(ctx context.Context, agentOwner uuid.UUID) error
 	Close() error
 }
 
 // InMemorySemanticCache implementa la caché semántica enteramente en memoria RAM caliente.
 type InMemorySemanticCache struct {
-	entries   []CacheEntry
+	entries   map[uuid.UUID][]CacheEntry
 	mu        sync.RWMutex
 	threshold float64
 }
@@ -41,7 +44,7 @@ func NewInMemorySemanticCache(threshold float64) *InMemorySemanticCache {
 		threshold = 0.95
 	}
 	return &InMemorySemanticCache{
-		entries:   make([]CacheEntry, 0),
+		entries:   make(map[uuid.UUID][]CacheEntry),
 		threshold: threshold,
 	}
 }
@@ -51,10 +54,13 @@ func (c *InMemorySemanticCache) Get(ctx context.Context, queryVector []float32) 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	agentOwner, _ := GetAgentOwner(ctx)
+	entries := c.entries[agentOwner]
+
 	var bestMatch string
 	var maxSimilarity float64 = -1.0
 
-	for _, entry := range c.entries {
+	for _, entry := range entries {
 		select {
 		case <-ctx.Done():
 			return "", false, ctx.Err()
@@ -82,12 +88,24 @@ func (c *InMemorySemanticCache) Set(ctx context.Context, queryText string, query
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.entries = append(c.entries, CacheEntry{
+	agentOwner, _ := GetAgentOwner(ctx)
+
+	c.entries[agentOwner] = append(c.entries[agentOwner], CacheEntry{
 		QueryText:    queryText,
 		QueryVector:  queryVector,
 		ResponseText: responseText,
 		CreatedAt:    time.Now(),
+		AgentOwner:   agentOwner,
 	})
+	return nil
+}
+
+// Invalidate limpia la caché para un agente propietario específico.
+func (c *InMemorySemanticCache) Invalidate(ctx context.Context, agentOwner uuid.UUID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delete(c.entries, agentOwner)
 	return nil
 }
 
@@ -99,7 +117,8 @@ func (c *InMemorySemanticCache) Close() error {
 // HybridRedisSemanticCache almacena los datos de caché en Redis para persistencia y mantiene un índice local en memoria para búsquedas semánticas de milisegundos.
 type HybridRedisSemanticCache struct {
 	pool      *redis.Pool
-	entries   []CacheEntry
+	entries   map[uuid.UUID][]CacheEntry
+	loaded    map[uuid.UUID]bool
 	mu        sync.RWMutex
 	threshold float64
 	keyPrefix string
@@ -129,53 +148,58 @@ func NewHybridRedisSemanticCache(redisAddress string, threshold float64) (*Hybri
 
 	cache := &HybridRedisSemanticCache{
 		pool:      pool,
-		entries:   make([]CacheEntry, 0),
+		entries:   make(map[uuid.UUID][]CacheEntry),
+		loaded:    make(map[uuid.UUID]bool),
 		threshold: threshold,
 		keyPrefix: "cache:semantic:entries",
-	}
-
-	// Cargar entradas existentes en Redis al índice de memoria RAM caliente
-	if err := cache.loadEntriesFromRedis(); err != nil {
-		// Log error but do not block startup
-		fmt.Printf("Warning: failed to warm up semantic cache from Redis: %v\n", err)
 	}
 
 	return cache, nil
 }
 
-func (c *HybridRedisSemanticCache) loadEntriesFromRedis() error {
+func (c *HybridRedisSemanticCache) loadEntriesForOwner(agentOwner uuid.UUID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.loaded[agentOwner] {
+		return nil
+	}
+
 	conn := c.pool.Get()
 	defer conn.Close()
 
-	// Obtener todas las entradas almacenadas en la lista de caché de Redis
-	values, err := redis.ByteSlices(conn.Do("LRANGE", c.keyPrefix, 0, -1))
+	key := fmt.Sprintf("%s:%s", c.keyPrefix, agentOwner.String())
+	values, err := redis.ByteSlices(conn.Do("LRANGE", key, 0, -1))
 	if err != nil && !errors.Is(err, redis.ErrNil) {
 		return err
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	for _, val := range values {
 		var entry CacheEntry
 		if err := json.Unmarshal(val, &entry); err == nil {
-			c.entries = append(c.entries, entry)
+			c.entries[agentOwner] = append(c.entries[agentOwner], entry)
 		}
 	}
 
-	fmt.Printf("[Semantic Cache] Warmed up with %d entries from Redis\n", len(c.entries))
+	c.loaded[agentOwner] = true
 	return nil
 }
 
 // Get busca la similitud de coseno en la caché caliente local.
 func (c *HybridRedisSemanticCache) Get(ctx context.Context, queryVector []float32) (string, bool, error) {
+	agentOwner, _ := GetAgentOwner(ctx)
+	if err := c.loadEntriesForOwner(agentOwner); err != nil {
+		fmt.Printf("Warning: failed to load semantic cache from Redis for owner %s: %v\n", agentOwner, err)
+	}
+
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	entries := c.entries[agentOwner]
 	var bestMatch string
 	var maxSimilarity float64 = -1.0
 
-	for _, entry := range c.entries {
+	for _, entry := range entries {
 		select {
 		case <-ctx.Done():
 			return "", false, ctx.Err()
@@ -200,11 +224,17 @@ func (c *HybridRedisSemanticCache) Get(ctx context.Context, queryVector []float3
 
 // Set guarda la nueva respuesta en la base de datos de Redis y actualiza el índice en caliente.
 func (c *HybridRedisSemanticCache) Set(ctx context.Context, queryText string, queryVector []float32, responseText string) error {
+	agentOwner, _ := GetAgentOwner(ctx)
+	if err := c.loadEntriesForOwner(agentOwner); err != nil {
+		fmt.Printf("Warning: failed to load semantic cache from Redis for owner %s: %v\n", agentOwner, err)
+	}
+
 	entry := CacheEntry{
 		QueryText:    queryText,
 		QueryVector:  queryVector,
 		ResponseText: responseText,
 		CreatedAt:    time.Now(),
+		AgentOwner:   agentOwner,
 	}
 
 	data, err := json.Marshal(entry)
@@ -216,11 +246,12 @@ func (c *HybridRedisSemanticCache) Set(ctx context.Context, queryText string, qu
 	conn := c.pool.Get()
 	defer conn.Close()
 
-	if err := conn.Send("RPUSH", c.keyPrefix, data); err != nil {
+	key := fmt.Sprintf("%s:%s", c.keyPrefix, agentOwner.String())
+	if err := conn.Send("RPUSH", key, data); err != nil {
 		return err
 	}
 	// Mantener el tamaño máximo de la caché de Redis en 1000 elementos
-	if err := conn.Send("LTRIM", c.keyPrefix, -1000, -1); err != nil {
+	if err := conn.Send("LTRIM", key, -1000, -1); err != nil {
 		return err
 	}
 	if err := conn.Flush(); err != nil {
@@ -237,12 +268,28 @@ func (c *HybridRedisSemanticCache) Set(ctx context.Context, queryText string, qu
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.entries = append(c.entries, entry)
-	if len(c.entries) > 1000 {
-		c.entries = c.entries[len(c.entries)-1000:]
+	c.entries[agentOwner] = append(c.entries[agentOwner], entry)
+	if len(c.entries[agentOwner]) > 1000 {
+		c.entries[agentOwner] = c.entries[agentOwner][len(c.entries[agentOwner])-1000:]
 	}
 
 	return nil
+}
+
+// Invalidate limpia la caché para un agente propietario específico tanto en memoria como en Redis.
+func (c *HybridRedisSemanticCache) Invalidate(ctx context.Context, agentOwner uuid.UUID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	delete(c.entries, agentOwner)
+	delete(c.loaded, agentOwner)
+
+	conn := c.pool.Get()
+	defer conn.Close()
+
+	key := fmt.Sprintf("%s:%s", c.keyPrefix, agentOwner.String())
+	_, err := conn.Do("DEL", key)
+	return err
 }
 
 // Close cierra el pool de conexiones de Redis.
