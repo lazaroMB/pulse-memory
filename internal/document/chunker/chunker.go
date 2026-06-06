@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"pulse/internal/document"
+	"pulse/internal/domain/entity"
 )
 
 type Chunker struct {
@@ -26,13 +26,13 @@ func NewChunker(size, overlap int) *Chunker {
 	}
 }
 
-func (c *Chunker) SplitToChunks(docID uuid.UUID, text string, baseMetadata map[string]string) []document.DocumentChunk {
+func (c *Chunker) SplitToChunks(docID uuid.UUID, text string, baseMetadata map[string]string) []entity.DocumentChunk {
 	if len(text) == 0 {
 		return nil
 	}
 
 	rawChunks := c.recursiveSplit(text, []string{"\n\n", "\n", ". ", "? ", "! ", " ", ""})
-	var chunks []document.DocumentChunk
+	var chunks []entity.DocumentChunk
 	chunkIndex := 0
 
 	var currentChunk strings.Builder
@@ -49,7 +49,7 @@ func (c *Chunker) SplitToChunks(docID uuid.UUID, text string, baseMetadata map[s
 					meta[k] = v
 				}
 
-				chunks = append(chunks, document.DocumentChunk{
+				chunks = append(chunks, entity.DocumentChunk{
 					ID:         uuid.New(),
 					DocumentID: docID,
 					ChunkIndex: chunkIndex,
@@ -79,7 +79,7 @@ func (c *Chunker) SplitToChunks(docID uuid.UUID, text string, baseMetadata map[s
 			meta[k] = v
 		}
 
-		chunks = append(chunks, document.DocumentChunk{
+		chunks = append(chunks, entity.DocumentChunk{
 			ID:         uuid.New(),
 			DocumentID: docID,
 			ChunkIndex: chunkIndex,
