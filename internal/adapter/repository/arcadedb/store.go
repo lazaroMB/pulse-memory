@@ -809,34 +809,45 @@ func (s *ArcadeDBStore) InsertDocumentChunks(ctx context.Context, chunks []entit
 		return nil
 	}
 
-	var sb strings.Builder
-	sb.WriteString("BEGIN;\n")
-	params := make(map[string]interface{})
+	const batchSize = 25 // insert 25 chunks at a time to avoid ArcadeDB script compilation OutOfMemory errors
 
-	for i, chunk := range chunks {
-		metadataBytes, _ := json.Marshal(chunk.Metadata)
-		vecStr := "[]"
-		if len(embeddings) > i && len(embeddings[i]) > 0 {
-			vecStr = float32SliceToSQLArray(embeddings[i])
+	for i := 0; i < len(chunks); i += batchSize {
+		end := i + batchSize
+		if end > len(chunks) {
+			end = len(chunks)
 		}
 
-		chunkKey := fmt.Sprintf("chunk_%d", i)
-		sb.WriteString(fmt.Sprintf(`CREATE VERTEX DocumentChunk SET id = :id_%[1]s, document_id = :document_id_%[1]s, chunk_index = :chunk_index_%[1]s, content = :content_%[1]s, embedding = %[2]s, metadata_json = :metadata_json_%[1]s;
+		var sb strings.Builder
+		sb.WriteString("BEGIN;\n")
+		params := make(map[string]interface{})
+
+		for j := i; j < end; j++ {
+			chunk := chunks[j]
+			metadataBytes, _ := json.Marshal(chunk.Metadata)
+			vecStr := "[]"
+			if len(embeddings) > j && len(embeddings[j]) > 0 {
+				vecStr = float32SliceToSQLArray(embeddings[j])
+			}
+
+			chunkKey := fmt.Sprintf("chunk_%d", j)
+			sb.WriteString(fmt.Sprintf(`CREATE VERTEX DocumentChunk SET id = :id_%[1]s, document_id = :document_id_%[1]s, chunk_index = :chunk_index_%[1]s, content = :content_%[1]s, embedding = %[2]s, metadata_json = :metadata_json_%[1]s;
 CREATE EDGE HAS_CHUNK FROM (SELECT FROM Document WHERE id = :document_id_%[1]s) TO (SELECT FROM DocumentChunk WHERE id = :id_%[1]s) IF NOT EXISTS;
 `, chunkKey, vecStr))
 
-		params["id_"+chunkKey] = chunk.ID.String()
-		params["document_id_"+chunkKey] = chunk.DocumentID.String()
-		params["chunk_index_"+chunkKey] = chunk.ChunkIndex
-		params["content_"+chunkKey] = chunk.Content
-		params["metadata_json_"+chunkKey] = string(metadataBytes)
-	}
-	sb.WriteString("COMMIT;")
+			params["id_"+chunkKey] = chunk.ID.String()
+			params["document_id_"+chunkKey] = chunk.DocumentID.String()
+			params["chunk_index_"+chunkKey] = chunk.ChunkIndex
+			params["content_"+chunkKey] = chunk.Content
+			params["metadata_json_"+chunkKey] = string(metadataBytes)
+		}
+		sb.WriteString("COMMIT;")
 
-	_, err := s.execute(ctx, "sqlscript", sb.String(), params)
-	if err != nil {
-		return fmt.Errorf("failed to insert document chunks: %w", err)
+		_, err := s.execute(ctx, "sqlscript", sb.String(), params)
+		if err != nil {
+			return fmt.Errorf("failed to insert document chunks batch %d-%d: %w", i, end, err)
+		}
 	}
+
 	return nil
 }
 

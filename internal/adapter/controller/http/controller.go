@@ -293,9 +293,18 @@ func (c *Controller) HandleIngestLink(w http.ResponseWriter, r *http.Request) {
 		srcType = entity.SourceWebPage
 	case "google_docs":
 		srcType = entity.SourceGoogleDocs
+	case "pdf":
+		srcType = entity.SourcePDF
 	default:
+		lowerURL := strings.ToLower(req.URL)
+		// Strip any query parameters for extension checking
+		if idx := strings.Index(lowerURL, "?"); idx != -1 {
+			lowerURL = lowerURL[:idx]
+		}
 		if strings.Contains(req.URL, "docs.google.com") {
 			srcType = entity.SourceGoogleDocs
+		} else if strings.HasSuffix(lowerURL, ".pdf") {
+			srcType = entity.SourcePDF
 		} else {
 			srcType = entity.SourceWebPage
 		}

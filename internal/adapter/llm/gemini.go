@@ -54,24 +54,38 @@ func (c *GeminiClient) GenerateEmbeddings(ctx context.Context, texts []string) (
 	if len(texts) == 0 {
 		return nil, nil
 	}
-	batch := c.embedModel.NewBatch()
-	for _, text := range texts {
-		batch.AddContent(genai.Text(text))
-	}
-	res, err := c.embedModel.BatchEmbedContents(ctx, batch)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate batch embeddings: %w", err)
-	}
-	if res == nil || len(res.Embeddings) != len(texts) {
-		return nil, fmt.Errorf("unexpected batch embedding response length: got %d, expected %d", len(res.Embeddings), len(texts))
-	}
-	embeddings := make([][]float32, len(res.Embeddings))
-	for i, emb := range res.Embeddings {
-		if emb == nil {
-			return nil, fmt.Errorf("nil embedding at index %d", i)
+
+	const batchSize = 100
+	embeddings := make([][]float32, len(texts))
+
+	for i := 0; i < len(texts); i += batchSize {
+		end := i + batchSize
+		if end > len(texts) {
+			end = len(texts)
 		}
-		embeddings[i] = emb.Values
+		chunk := texts[i:end]
+
+		batch := c.embedModel.NewBatch()
+		for _, text := range chunk {
+			batch.AddContent(genai.Text(text))
+		}
+
+		res, err := c.embedModel.BatchEmbedContents(ctx, batch)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate batch embeddings for slice %d-%d: %w", i, end, err)
+		}
+		if res == nil || len(res.Embeddings) != len(chunk) {
+			return nil, fmt.Errorf("unexpected batch embedding response length: got %d, expected %d", len(res.Embeddings), len(chunk))
+		}
+
+		for j, emb := range res.Embeddings {
+			if emb == nil {
+				return nil, fmt.Errorf("nil embedding at index %d", i+j)
+			}
+			embeddings[i+j] = emb.Values
+		}
 	}
+
 	return embeddings, nil
 }
 

@@ -37,13 +37,34 @@ func (wp *WorkerPool) processDocumentJob(ctx context.Context, workerID int, job 
 	switch job.SourceType {
 	case entity.SourcePDF:
 		p = &parser.PDFParser{}
-		f, err := os.Open(job.FilePath)
-		if err != nil {
-			wp.failJob(ctx, workerID, job.DocumentID, fmt.Errorf("failed to open local pdf: %w", err))
+		if job.FilePath != "" {
+			f, err := os.Open(job.FilePath)
+			if err != nil {
+				wp.failJob(ctx, workerID, job.DocumentID, fmt.Errorf("failed to open local pdf: %w", err))
+				return
+			}
+			reader = f
+			closeFn = func() { f.Close() }
+		} else if job.URL != "" {
+			req, err := http.NewRequestWithContext(ctx, "GET", job.URL, nil)
+			if err != nil {
+				wp.failJob(ctx, workerID, job.DocumentID, fmt.Errorf("failed to create pdf request: %w", err))
+				return
+			}
+			req.Header.Set("User-Agent", "PulseSwarmMemoryIngester/1.0")
+
+			client := &http.Client{Timeout: 30 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				wp.failJob(ctx, workerID, job.DocumentID, fmt.Errorf("failed to fetch pdf page: %w", err))
+				return
+			}
+			reader = resp.Body
+			closeFn = func() { resp.Body.Close() }
+		} else {
+			wp.failJob(ctx, workerID, job.DocumentID, fmt.Errorf("no source path or URL provided for PDF"))
 			return
 		}
-		reader = f
-		closeFn = func() { f.Close() }
 
 	case entity.SourceMarkdown:
 		p = &parser.MarkdownParser{}

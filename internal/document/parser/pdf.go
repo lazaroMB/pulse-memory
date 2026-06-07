@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os/exec"
 	"strings"
 
 	"github.com/dslipak/pdf"
@@ -13,6 +14,34 @@ import (
 type PDFParser struct{}
 
 func (p *PDFParser) Parse(ctx context.Context, src io.Reader, options map[string]string) (*ParsedContent, error) {
+	// First check if pdftotext is available in the system path
+	if pdftotextPath, err := exec.LookPath("pdftotext"); err == nil {
+		cmd := exec.CommandContext(ctx, pdftotextPath, "-", "-")
+		cmd.Stdin = src
+
+		var stdoutBuf, stderrBuf bytes.Buffer
+		cmd.Stdout = &stdoutBuf
+		cmd.Stderr = &stderrBuf
+
+		if err := cmd.Run(); err == nil {
+			text := stdoutBuf.String()
+			pageCount := strings.Count(text, "\x0c")
+			if pageCount == 0 && len(text) > 0 {
+				pageCount = 1
+			}
+
+			metadata := make(map[string]string)
+			metadata["page_count"] = fmt.Sprintf("%d", pageCount)
+			metadata["parser"] = "pdftotext"
+
+			return &ParsedContent{
+				Text:     text,
+				Metadata: metadata,
+			}, nil
+		}
+		// If pdftotext fails, fall through and use native reader
+	}
+
 	buf, err := io.ReadAll(src)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read pdf stream: %w", err)
@@ -43,6 +72,7 @@ func (p *PDFParser) Parse(ctx context.Context, src io.Reader, options map[string
 
 	metadata := make(map[string]string)
 	metadata["page_count"] = fmt.Sprintf("%d", numPages)
+	metadata["parser"] = "native"
 
 	return &ParsedContent{
 		Text:     sb.String(),
